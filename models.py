@@ -272,7 +272,10 @@ class DiT(nn.Module):
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:
-            x = block(x, c) + x                   # (N, T, D)
+            if self.args.use_mamba:
+                x = block(x, c) + x                   # (N, T, D)
+            else:
+                x = block(x, c)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
