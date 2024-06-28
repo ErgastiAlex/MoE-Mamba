@@ -126,7 +126,17 @@ def main(args):
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
     # Setup an experiment folder:
-    if rank == 0:
+    if args.continue_train and rank == 0:
+        checkpoint_dir = f"{args.experiment_dir}/checkpoints/"
+        sample_dir = f"{args.experiment_dir}/samples"
+        logger = create_logger(args.experiment_dir)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(sample_dir, exist_ok=True)
+        logger.info(f"Experiment directory founded at {args.experiment_dir}")
+        logger.info(f"Checkpoint directory founded at {checkpoint_dir}")
+        logger.info(f"Sample directory founded at {sample_dir}")
+    
+    elif not args.continue_train and rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
         experiment_index = len(glob(f"{args.results_dir}/*"))
         model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
@@ -136,11 +146,11 @@ def main(args):
             dit_type = "standard"
         experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}--{dit_type}"  # Create an experiment folder
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
-        results_dir = f"{experiment_dir}/results"  # Stores saved model checkpoints
+        sample_dir = f"{experiment_dir}/samples"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
-        os.makedirs(results_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
+        
     else:
         logger = create_logger(None)
 
@@ -154,10 +164,10 @@ def main(args):
     )
         
     if args.continue_train:
-        ckpt_path = args.ckpt or f"DiT-XL-2-{args.image_size}x{args.image_size}.pt"
+        ckpt_path = f"{checkpoint_dir}/{args.train_steps:07d}.pt"
         state_dict = find_model(ckpt_path)
         model.load_state_dict(state_dict)
-        print("Loaded checkpoints!", flush=True)
+        logger.info("Loaded checkpoints!")
         
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
@@ -202,12 +212,14 @@ def main(args):
     ema.eval()  # EMA model should always be in eval mode
 
     # Variables for monitoring/logging purposes:
-    train_steps = 0
+    train_steps = args.train_steps
     log_steps = 0
     running_loss = 0
     start_time = time()
 
     logger.info(f"Training for {args.epochs} epochs...")
+    if args.continue_train:
+        logger.info(f"Resume training from step: {args.train_steps}")
     for epoch in range(args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
@@ -225,9 +237,6 @@ def main(args):
             loss.backward()
             opt.step()
             update_ema(ema, model)
-            
-            
-           
 
             # Log loss values:
             running_loss += loss.item()
@@ -286,7 +295,7 @@ def main(args):
                     samples = vae.decode(samples / 0.18215).sample
 
                     # Save and display images:
-                    save_image(samples, f"{results_dir}/sample_{train_steps}.png", nrow=4, normalize=True, value_range=(-1, 1))
+                    save_image(samples, f"{sample_dir}/sample_{train_steps}.png", nrow=4, normalize=True, value_range=(-1, 1))
                     model.train()
 
 
@@ -301,7 +310,8 @@ if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-path", type=str, required=True)
-    parser.add_argument("--results-dir", type=str, default="results")
+    parser.add_argument("--results_dir", type=str, default="results")
+    parser.add_argument("--experiment_dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=2)
@@ -322,5 +332,6 @@ if __name__ == "__main__":
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
     parser.add_argument("--continue_train",  action='store_true')
     parser.add_argument("--train_steps", type=int, default=0)
+    
     args = parser.parse_args()
     main(args)
