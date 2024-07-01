@@ -148,6 +148,7 @@ def main(args):
         checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
         sample_dir = f"{experiment_dir}/samples"  # Stores saved model checkpoints
         os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(sample_dir, exist_ok=True)
         logger = create_logger(experiment_dir)
         logger.info(f"Experiment directory created at {experiment_dir}")
         
