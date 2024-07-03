@@ -1,4 +1,4 @@
-# Code Implementation of the MambaIR Model
+
 import math
 import torch
 import torch.nn as nn
@@ -6,7 +6,7 @@ import torch.utils.checkpoint as checkpoint
 import torch.nn.functional as F
 from functools import partial
 from typing import Optional, Callable
-from registry import ARCH_REGISTRY
+from util.registry import ARCH_REGISTRY
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 from einops import rearrange, repeat
@@ -282,7 +282,7 @@ class SS2D(nn.Module):
         
         if style is not None:
             style = torch.stack([style.view(B, -1, L), torch.transpose(style, dim0=2, dim1=3).contiguous().view(B, -1, L)], dim=1).view(B, 2, -1, L)
-            style = torch.cat([style, style], dim=1) # (1, 4, 192, 3136)
+            style = torch.cat([style, torch.flip(style, dims=[-1])], dim=1) # (1, 4, 192, 3136)
             s_dbl = torch.einsum("b k d l, k c d -> b k c l", style.view(B, K, -1, L), self.style_proj_weight)
             
             if self.args != None and self.args.c_style:
@@ -303,7 +303,19 @@ class SS2D(nn.Module):
         Ds = self.Ds.float().view(-1)
         As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)
         dt_projs_bias = self.dt_projs_bias.float().view(-1) # (k * d)
-        out_y = self.selective_scan(
+        
+        if style is not None:
+            style = style.float().view(B, -1, L)
+            
+            out_y = self.selective_scan(
+            style, dts,
+            As, Bs, Cs, Ds, z=None,
+            delta_bias=dt_projs_bias,
+            delta_softplus=True,
+            return_last_state=False,
+        ).view(B, K, -1, L)
+        else:
+            out_y = self.selective_scan(
             xs, dts,
             As, Bs, Cs, Ds, z=None,
             delta_bias=dt_projs_bias,
@@ -373,15 +385,15 @@ class VSSBlock(nn.Module):
         self.skip_scale= nn.Parameter(torch.ones(hidden_dim))
         # self.conv_blk = CAB(hidden_dim,is_light_sr)
         # self.ln_2 = nn.LayerNorm(hidden_dim)
-        # self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
+        self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
         self.norm = nn.LayerNorm(hidden_dim)
 
 
     def forward(self, input, style=None):
         # x [B,HW,C]
-        # input = rearrange(input, 'b d l -> b l d')
+        input = rearrange(input, 'l b d -> b l d')
         if style is not None:
-            # style = rearrange(style, 'b d l -> b l d')
+            style = rearrange(style, 'l b d -> b l d')
             rnd = torch.rand(style.shape[1])
             indexes = torch.argsort(rnd)
             
@@ -399,7 +411,7 @@ class VSSBlock(nn.Module):
         x = x.view(B, -1, C).contiguous()
         # norm here used if there's no channel attention
         x = self.norm(x)
-        # x = rearrange(x, 'b l d -> b d l')
+        x = rearrange(x, 'b l d -> l b d')
         return x
 
 
