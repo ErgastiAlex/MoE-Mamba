@@ -390,9 +390,9 @@ class VSSBlock(nn.Module):
 
     def forward(self, input, style=None):
         # x [B,HW,C]
-        input = rearrange(input, 'l b d -> b l d')
+        # input = rearrange(input, 'l b d -> b l d')
         if style is not None:
-            style = rearrange(style, 'l b d -> b l d')
+            # style = rearrange(style, 'l b d -> b l d')
             rnd = torch.rand(style.shape[1])
             indexes = torch.argsort(rnd)
             
@@ -410,7 +410,7 @@ class VSSBlock(nn.Module):
         x = x.view(B, -1, C).contiguous()
         # norm here used if there's no channel attention
         x = self.norm(x)
-        x = rearrange(x, 'b l d -> l b d')
+        # x = rearrange(x, 'b l d -> l b d')
         return x
 
 
