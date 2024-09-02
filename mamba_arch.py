@@ -10,10 +10,26 @@ from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 from einops import rearrange, repeat
 import numpy as np
-
+import einops
 
 NEG_INF = -1000000
 
+
+class MoE(nn.Module):
+    def __init__(self, hidden_dim, num_moe):
+        super(MoE, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.SiLU(),
+            nn.Linear(4 * hidden_dim, num_moe),
+        )
+
+        self.soft = nn.Softmax(dim=-1)
+    
+    def forward(self, x):
+        logits = self.net(x)
+        
+        return logits, self.soft(logits)
 
 class ChannelAttention(nn.Module):
     """Channel attention used in RCAN.
@@ -213,6 +229,8 @@ class SS2D(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
 
+        self.moe = MoE(self.d_inner, 4)
+
     @staticmethod
     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
                 **factory_kwargs):
@@ -341,7 +359,7 @@ class SS2D(nn.Module):
             # remove act
             style = self.in_style_proj(style)
             
-        x = x.permute(0, 3, 1, 2).contiguous()
+        x = x.permute(0, 3, 1, 2).contiguous() # (b, c, h, w)
         x = self.act(self.conv2d(x))
         
         if style is not None:
@@ -350,9 +368,14 @@ class SS2D(nn.Module):
             y1, y2, y3, y4 = self.forward_core(x, style=style)
         else:
             y1, y2, y3, y4 = self.forward_core(x)
-            
+
+
         assert y1.dtype == torch.float32
-        y = y1 + y2 + y3 + y4
+        _, weight_moe = self.moe(einops.rearrange(x, 'b d h w -> b (h w) d'))
+        y = torch.stack([y1, y2, y3, y4], dim=1)
+        y = torch.einsum("b k c l, b l k -> b c l", y, weight_moe)
+        
+        # y = y1 + y2 + y3 + y4
         y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
         y = self.out_norm(y)
         y = y * F.silu(z)
@@ -398,7 +421,6 @@ class VSSBlock(nn.Module):
             
         if self.args is not None and self.args.rnd_style:
             style = style[:,indexes,:]
-            
         B, L, C = input.shape
         input = input.view(B, int(np.sqrt(L)), int(np.sqrt(L)), C).contiguous()  # [B,H,W,C]
         if style is not None:
