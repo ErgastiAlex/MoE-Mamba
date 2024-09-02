@@ -12,9 +12,7 @@ import torch
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
 import numpy as np
@@ -32,6 +30,11 @@ from download import find_model
 from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
+from diffusion.rectified_flow import RectifiedFlow
+
+
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration, set_seed
 
 
 #################################################################################
@@ -59,30 +62,19 @@ def requires_grad(model, flag=True):
         p.requires_grad = flag
 
 
-def cleanup():
-    """
-    End DDP training.
-    """
-    dist.destroy_process_group()
-
 
 def create_logger(logging_dir):
     """
     Create a logger that writes to a log file and stdout.
     """
-    if dist.get_rank() == 0:  # real logger
-        logging.basicConfig(
-            level=logging.INFO,
-            format='[\033[34m%(asctime)s\033[0m] %(message)s',
-            datefmt='%Y-%m-%d %H:%M:%S',
-            handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
-        )
-        logger = logging.getLogger(__name__)
-    else:  # dummy logger (does nothing)
-        logger = logging.getLogger(__name__)
-        logger.addHandler(logging.NullHandler())
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[\033[34m%(asctime)s\033[0m] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+        handlers=[logging.StreamHandler(), logging.FileHandler(f"{logging_dir}/log.txt")]
+    )
+    logger = logging.getLogger(__name__)
     return logger
-
 
 def center_crop_arr(pil_image, image_size):
     """
@@ -115,45 +107,27 @@ def main(args):
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
-    # Setup DDP:
-    dist.init_process_group("nccl")
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
-    rank = 0
-    device = 0
-    seed = args.global_seed * dist.get_world_size() + rank
-    torch.manual_seed(seed)
-    torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
-
-    # Setup an experiment folder:
-    if args.continue_train and rank == 0:
-        checkpoint_dir = f"{args.experiment_dir}/checkpoints/"
-        sample_dir = f"{args.experiment_dir}/samples"
-        logger = create_logger(args.experiment_dir)
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        os.makedirs(sample_dir, exist_ok=True)
-        logger.info(f"Experiment directory founded at {args.experiment_dir}")
-        logger.info(f"Checkpoint directory founded at {checkpoint_dir}")
-        logger.info(f"Sample directory founded at {sample_dir}")
+    os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
+    model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
+    experiment_dir = f"{args.results_dir}/{model_string_name}"  # Create an experiment folder
+    checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    logger = create_logger(experiment_dir)
+    logger.info(f"Experiment directory created at {experiment_dir}")
     
-    elif not args.continue_train and rank == 0:
-        os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
-        experiment_index = len(glob(f"{args.results_dir}/*"))
-        model_string_name = args.model.replace("/", "-")  # e.g., DiT-XL/2 --> DiT-XL-2 (for naming folders)
-        if args.use_mamba:
-            dit_type = "mamba"
-        else:
-            dit_type = "standard"
-        experiment_dir = f"{args.results_dir}/{experiment_index:03d}-{model_string_name}--{dit_type}"  # Create an experiment folder
-        checkpoint_dir = f"{experiment_dir}/checkpoints"  # Stores saved model checkpoints
-        sample_dir = f"{experiment_dir}/samples"  # Stores saved model checkpoints
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        os.makedirs(sample_dir, exist_ok=True)
-        logger = create_logger(experiment_dir)
-        logger.info(f"Experiment directory created at {experiment_dir}")
-        
-    else:
-        logger = create_logger(None)
+    try:
+        checkpoint_files = os.listdir(checkpoint_dir)
+        checkpoint_files = [int(x.split("_")[-1]) for x in checkpoint_files]
+        checkpoint_files.sort()
+        checkpoint_file = checkpoint_files[-1]
+    except:
+        checkpoint_file = 0
+
+    accelerator_project_config = ProjectConfiguration(project_dir=experiment_dir, automatic_checkpoint_naming=True, iteration = checkpoint_file+1)
+    accelerator = Accelerator(project_config=accelerator_project_config)
+    
+    set_seed(args.global_seed)  # Set global seed for reproducibility
+
 
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
@@ -161,21 +135,23 @@ def main(args):
     model = DiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
-        args=args
+        args=args,
+        learn_sigma=False,
+        use_checkpoint=True,
     )
         
-    if args.continue_train:
-        ckpt_path = f"{checkpoint_dir}/{args.train_steps:07d}.pt"
-        state_dict = find_model(ckpt_path)
-        model.load_state_dict(state_dict)
-        logger.info("Loaded checkpoints!")
-        
     # Note that parameter initialization is done within the DiT constructor
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
+    ema = deepcopy(model)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = model.to(device)
-    diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
+    model = model
+
+
+    if args.use_rf:
+        rectified_flow = RectifiedFlow(num_timesteps=25)
+    else:
+        diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
+
+    vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}")
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
@@ -189,18 +165,11 @@ def main(args):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
     dataset = ImageFolder(args.data_path, transform=transform)
-    sampler = DistributedSampler(
-        dataset,
-        num_replicas=dist.get_world_size(),
-        rank=rank,
-        shuffle=True,
-        seed=args.global_seed
-    )
+
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True
@@ -212,30 +181,42 @@ def main(args):
     model.train()  # important! This enables embedding dropout for classifier-free guidance
     ema.eval()  # EMA model should always be in eval mode
 
-    # Variables for monitoring/logging purposes:
-    train_steps = args.train_steps
-    log_steps = 0
-    running_loss = 0
-    start_time = time()
+    vae, model, ema, opt, loader = accelerator.prepare(vae, model, ema, opt, loader)
 
-    logger.info(f"Training for {args.epochs} epochs...")
-    if args.continue_train:
-        logger.info(f"Resume training from step: {args.train_steps}")
+
+  # Variables for monitoring/logging purposes:
+    train_steps = 0
+    log_steps = 0
+    try:
+        accelerator.load_state()
+        logger.info(f"Checkpoint found, starting from {checkpoint_file*args.ckpt_every} steps.")
+        train_steps = checkpoint_file*args.ckpt_every
+        log_steps = train_steps % args.log_every
+    except:
+        # accelerator.save_state()
+        logger.info("No checkpoint found, starting from scratch.")
+    
+    device = accelerator.device 
+
     for epoch in range(args.epochs):
-        sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
+            x = x
+            y = y
             with torch.no_grad():
-                # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+
             model_kwargs = dict(y=y)
-            loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+            if args.use_rf:
+                loss_dict = rectified_flow.training_loss(model, x, model_kwargs)
+            else:
+                t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
+                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
-            loss.backward()
+            accelerator.backward(loss)
+
             opt.step()
             update_ema(ema, model)
 
@@ -249,9 +230,7 @@ def main(args):
                 end_time = time()
                 steps_per_sec = log_steps / (end_time - start_time)
                 # Reduce loss history over all processes:
-                avg_loss = torch.tensor(running_loss / log_steps, device=device)
-                # dist.all_reduce(avg_loss, op=dist.ReduceOp.SUM)
-                avg_loss = avg_loss.item() / dist.get_world_size()
+                avg_loss = running_loss / log_steps
                 logger.info(f"(step={train_steps:07d}) Train Loss: {avg_loss:.4f}, Train Steps/Sec: {steps_per_sec:.2f}")
                 # Reset monitoring variables:
                 running_loss = 0
@@ -260,26 +239,23 @@ def main(args):
 
             # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
-                if rank == 0:
-                    checkpoint = {
-                        "model": model.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
-                        "args": args
-                    }
-                    checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
-                    torch.save(checkpoint, checkpoint_path)
-                    logger.info(f"Saved checkpoint to {checkpoint_path}")
-                # dist.barrier()
+                accelerator.save_state()
+                logger.info(f"Checkpoint saved at step {train_steps}.")
             
             if train_steps % args.sample_every == 0 and train_steps > 0:
                 with torch.no_grad():
                     model.eval()
+                    device = x.device
+
                     class_labels = [0,1,2,0,1,2,0,1]
 
                     # Create sampling noise:
                     n = len(class_labels)
-                    z = torch.randn(n, 4, latent_size, latent_size, device=device)
+                    if args.use_rf:
+                        z = torch.randn(n, 4, latent_size, latent_size, device=device)*rectified_flow.noise_scale
+                    else:
+                        z = torch.randn(n, 4, latent_size, latent_size, device=device)
+
                     y = torch.tensor(class_labels, device=device)
 
                     # Setup classifier-free guidance:
@@ -288,23 +264,35 @@ def main(args):
                     y = torch.cat([y, y_null], 0)
                     model_kwargs = dict(y=y, cfg_scale=4.0)
 
+
                     # Sample images:
-                    samples = diffusion.p_sample_loop(
-                        model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device
-                    )
+                    if args.use_rf:
+                        samples = rectified_flow.sample(
+                            model.forward_with_cfg, z, model_kwargs=model_kwargs, progress=True)
+                    else:
+                        samples = diffusion.p_sample_loop(
+                            model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device)
+
                     samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
                     samples = vae.decode(samples / 0.18215).sample
 
                     # Save and display images:
-                    save_image(samples, f"{sample_dir}/sample_{train_steps}.png", nrow=4, normalize=True, value_range=(-1, 1))
+                    save_image(samples, f"{experiment_dir}/sample_{train_steps}.png", nrow=4, normalize=True, value_range=(-1, 1))
                     model.train()
-
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
 
+    checkpoint_path = f"{checkpoint_dir}/last.pt"
+    accelerator.save({
+            "model": accelerator.unwrap_model(model).state_dict(),
+            "ema": accelerator.unwrap_model(ema).state_dict(),
+            "opt": opt.optimizer.state_dict(),
+            "args": args
+        }, checkpoint_path)
+    logger.info(f"Saved last to {checkpoint_path}")
+    
     logger.info("Done!")
-    cleanup()
 
 
 if __name__ == "__main__":
@@ -318,11 +306,10 @@ if __name__ == "__main__":
     parser.add_argument("--num-classes", type=int, default=2)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=1)
-    parser.add_argument("--log-every", type=int, default=100)
+    parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
     parser.add_argument("--sample-every", type=int, default=10_000)
     parser.add_argument('--use_mamba', action='store_true') 
@@ -333,6 +320,7 @@ if __name__ == "__main__":
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
     parser.add_argument("--continue_train",  action='store_true')
     parser.add_argument("--train_steps", type=int, default=0)
+    parser.add_argument("--use_rf", action='store_true')
     
     args = parser.parse_args()
     main(args)

@@ -10,10 +10,26 @@ from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 from einops import rearrange, repeat
 import numpy as np
-
+import torch.utils.checkpoint as checkpoint
+import einops
 
 NEG_INF = -1000000
 
+class MoE(nn.Module):
+    def __init__(self, hidden_dim, num_moe):
+        super(MoE, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(hidden_dim, 4 * hidden_dim),
+            nn.SiLU(),
+            nn.Linear(4 * hidden_dim, num_moe),
+        )
+
+        self.soft = nn.Softmax(dim=-1)
+    
+    def forward(self, x):
+        logits = self.net(x)
+        
+        return logits, self.soft(logits)
 
 class ChannelAttention(nn.Module):
     """Channel attention used in RCAN.
@@ -213,6 +229,9 @@ class SS2D(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
 
+        self.moe = MoE(self.d_inner, 4)
+
+
     @staticmethod
     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
                 **factory_kwargs):
@@ -274,7 +293,17 @@ class SS2D(nn.Module):
         B, C, H, W = x.shape
         L = H * W
         K = 4
-        x_hwwh = torch.stack([x.view(B, -1, L), torch.transpose(x, dim0=2, dim1=3).contiguous().view(B, -1, L)], dim=1).view(B, 2, -1, L)
+
+
+        x_hw = x
+        x_hw[:,:,:,1::2] = torch.flip(x_hw[:,:,:,1::2], dims=[2]) #flip column
+
+        x_wh = x
+        x_wh[:,:,1::2,:] = torch.flip(x_wh[:,:,1::2,:], dims=[3]) #flip row
+        x_wh = torch.transpose(x_wh, dim0=2, dim1=3)
+
+        x_hwwh = torch.stack([x_hw,x_wh], dim=1).view(B, 2, -1, L)
+
         xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
 
         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
@@ -322,13 +351,22 @@ class SS2D(nn.Module):
             return_last_state=False,
         ).view(B, K, -1, L)
             
-        assert out_y.dtype == torch.float
+        out_hw = out_y[:, 0].view(B, -1, H, W)
+        out_hw[:,:,:,1::2] = torch.flip(out_hw[:,:,:,1::2], dims=[2]) #flip column
 
-        inv_y = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
-        wh_y = torch.transpose(out_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
-        invwh_y = torch.transpose(inv_y[:, 1].view(B, -1, W, H), dim0=2, dim1=3).contiguous().view(B, -1, L)
+        out_wh = out_y[:, 1].view(B, -1, W, H)
+        out_wh = torch.transpose(out_wh, dim0=2, dim1=3)
+        out_wh[:,:,1::2,:] = torch.flip(out_wh[:,:,1::2,:], dims=[3]) #flip row
 
-        return out_y[:, 0], inv_y[:, 0], wh_y, invwh_y
+        out_inv = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
+        out_inv_hw = out_inv[:, 0].view(B, -1, H, W)
+        out_inv_hw[:,:,:,1::2] = torch.flip(out_inv_hw[:,:,:,1::2], dims=[2]) #flip column
+
+        out_inv_wh = out_inv[:, 1].view(B, -1, W, H)
+        out_inv_wh = torch.transpose(out_inv_wh, dim0=2, dim1=3)
+        out_inv_wh[:,:,1::2,:] = torch.flip(out_inv_wh[:,:,1::2,:], dims=[3]) #flip row
+
+        return out_hw, out_wh, out_inv_hw, out_inv_wh
 
     def forward(self, x: torch.Tensor, style=None, **kwargs):
         B, H, W, C = x.shape
@@ -352,7 +390,10 @@ class SS2D(nn.Module):
             y1, y2, y3, y4 = self.forward_core(x)
             
         assert y1.dtype == torch.float32
-        y = y1 + y2 + y3 + y4
+        _, weight_moe = self.moe(einops.rearrange(x, 'b d h w -> b (h w) d'))
+        y = torch.stack([y1, y2, y3, y4], dim=1)
+        y = torch.einsum("b k c l, b l k -> b c l", y, weight_moe)
+        
         y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
         y = self.out_norm(y)
         y = y * F.silu(z)
@@ -374,6 +415,7 @@ class VSSBlock(nn.Module):
             is_light_sr: bool = False,
             is_cross=False,
             args=None,
+            use_checkpoint=False,
             **kwargs,
     ):
         super().__init__()
@@ -387,8 +429,15 @@ class VSSBlock(nn.Module):
         self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
         self.norm = nn.LayerNorm(hidden_dim)
 
+        self.use_checkpoint = use_checkpoint
 
     def forward(self, input, style=None):
+        if self.use_checkpoint:
+            return checkpoint.checkpoint(self._forward, input, style)
+        else:
+            return  self._forward(input, style=None)
+
+    def _forward(self, input, style=None):
         # x [B,HW,C]
         # input = rearrange(input, 'l b d -> b l d')
         if style is not None:

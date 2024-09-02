@@ -15,6 +15,8 @@ import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 from mamba_arch import VSSBlock
+import einops
+import torch.utils.checkpoint as checkpoint
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -102,7 +104,7 @@ class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, args=None, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, args=None, use_checkpoint=True, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.args = args
@@ -116,52 +118,29 @@ class DiTBlock(nn.Module):
                 d_state=16,
                 input_resolution=256,
                 is_cross=True,
-                args=args)
-            self.self_attn = VSSBlock(
-                hidden_dim= hidden_size,
-                drop_path=0,
-                norm_layer=nn.LayerNorm,
-                attn_drop_rate=0,
-                d_state=16,
-                input_resolution=256,
-                is_cross=False,
-                args=args)
-            self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-            self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-            mlp_hidden_dim = int(hidden_size * mlp_ratio)
-            approx_gelu = lambda: nn.GELU(approximate="tanh")
-            self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+                args=args,
+                use_checkpoint=use_checkpoint)
         else:
             self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-            self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-            self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-            mlp_hidden_dim = int(hidden_size * mlp_ratio)
-            approx_gelu = lambda: nn.GELU(approximate="tanh")
-            self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-            self.adaLN_modulation = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-            )
 
+        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+        )
     def forward(self, x, c):
-        if self.args is not None and self.args.use_mamba:
-            # c = c.unsqueeze(1).repeat(1,256,1)
-            # x = self.attn(x, c)
-            # return x  
-            c = c.unsqueeze(1).repeat(1,256,1)
-            x = self.self_attn(self.norm1(x)) + x
-            x = self.attn(self.norm2(x), c) + x
-            x = self.mlp(self.norm3(x)) + x
-            return x 
-        else:
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-            return x
+        return checkpoint.checkpoint(self._forward, x, c)
     
-            
-            
-
+    def _forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        return x
+    
 
 class FinalLayer(nn.Module):
     """
@@ -172,21 +151,16 @@ class FinalLayer(nn.Module):
         self.args = args
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
-        if self.args is not None and not self.args.use_mamba:
-            self.adaLN_modulation = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(hidden_size, 2 * hidden_size, bias=True)
-            )
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_size, 2 * hidden_size, bias=True)
+        )
 
     def forward(self, x, c):
-        if self.args is not None and self.args.use_mamba:
-            x = self.linear(self.norm_final(x))
-            return x
-        else:
-            shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
-            x = modulate(self.norm_final(x), shift, scale)
-            x = self.linear(x)
-            return x
+        shift, scale = self.adaLN_modulation(c).chunk(2, dim=1)
+        x = modulate(self.norm_final(x), shift, scale)
+        x = self.linear(x)
+        return x
         
 
 
@@ -207,6 +181,7 @@ class DiT(nn.Module):
         num_classes=1000,
         learn_sigma=True,
         args=None,
+        use_checkpoint=True
     ):
         super().__init__()
         self.args = args
@@ -225,7 +200,7 @@ class DiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, args=args) for _ in range(depth)
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, args=args,use_checkpoint=use_checkpoint) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, args)
         self.initialize_weights()
@@ -295,10 +270,7 @@ class DiT(nn.Module):
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:
-            if self.args.use_mamba:
-                x = block(x, c) + x                   # (N, T, D)
-            else:
-                x = block(x, c)
+            x = block(x, c)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
