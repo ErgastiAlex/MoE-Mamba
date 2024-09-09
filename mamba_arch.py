@@ -10,10 +10,12 @@ from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 from mamba_ssm.ops.selective_scan_interface import selective_scan_fn, selective_scan_ref
 from einops import rearrange, repeat
 import numpy as np
-import torch.utils.checkpoint as checkpoint
 import einops
 
 NEG_INF = -1000000
+
+def modulate(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1).unsqueeze(1)) + shift.unsqueeze(1).unsqueeze(1)
 
 class MoE(nn.Module):
     def __init__(self, hidden_dim, num_moe):
@@ -139,13 +141,12 @@ class SS2D(nn.Module):
             bias=False,
             device=None,
             dtype=None,
-            is_cross=False,
-            args=None,
+            use_moe=False,
             **kwargs,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
-        self.args=args
+        self.use_moe = use_moe
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
@@ -154,7 +155,6 @@ class SS2D(nn.Module):
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
 
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
-        self.in_style_proj = nn.Linear(self.d_model, self.d_inner, bias=bias, **factory_kwargs)
         self.conv2d = nn.Conv2d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
@@ -166,42 +166,12 @@ class SS2D(nn.Module):
         )
         self.act = nn.SiLU()
 
-        if is_cross:
-            if self.args != None and self.args.c_style:
-                self.style_proj = (
-                    nn.Linear(self.d_inner, self.d_state, bias=False, **factory_kwargs),
-                    nn.Linear(self.d_inner, self.d_state, bias=False, **factory_kwargs),
-                    nn.Linear(self.d_inner, self.d_state, bias=False, **factory_kwargs),
-                    nn.Linear(self.d_inner, self.d_state, bias=False, **factory_kwargs),
-                )
-                self.x_proj = (
-                    nn.Linear(self.d_inner, (self.dt_rank + self.d_state), bias=False, **factory_kwargs),
-                    nn.Linear(self.d_inner, (self.dt_rank + self.d_state), bias=False, **factory_kwargs),
-                    nn.Linear(self.d_inner, (self.dt_rank + self.d_state), bias=False, **factory_kwargs),
-                    nn.Linear(self.d_inner, (self.dt_rank + self.d_state), bias=False, **factory_kwargs),
-                )
-            elif self.args != None and self.args.c_input:
-                self.style_proj = (
-                    nn.Linear(self.d_inner, (self.dt_rank + self.d_state), bias=False, **factory_kwargs),
-                    nn.Linear(self.d_inner, (self.dt_rank + self.d_state), bias=False, **factory_kwargs),
-                    nn.Linear(self.d_inner, (self.dt_rank + self.d_state), bias=False, **factory_kwargs),
-                    nn.Linear(self.d_inner, (self.dt_rank + self.d_state), bias=False, **factory_kwargs),
-                )
-                self.x_proj = (
-                    nn.Linear(self.d_inner, self.d_state, bias=False, **factory_kwargs),
-                    nn.Linear(self.d_inner, self.d_state, bias=False, **factory_kwargs),
-                    nn.Linear(self.d_inner, self.d_state, bias=False, **factory_kwargs),
-                    nn.Linear(self.d_inner, self.d_state, bias=False, **factory_kwargs),
-                )
-            self.style_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.style_proj], dim=0))  # (K=4, N, inner)
-            del self.style_proj
-        else:
-            self.x_proj = (
+        self.x_proj = (
                 nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
                 nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
                 nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
                 nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
-            )
+        )
         
         self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))  # (K=4, N, inner)
         del self.x_proj
@@ -229,7 +199,8 @@ class SS2D(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
 
-        self.moe = MoE(self.d_inner, 4)
+        if self.use_moe:
+            self.moe = MoE(self.d_inner, 4)
 
 
     @staticmethod
@@ -289,11 +260,10 @@ class SS2D(nn.Module):
         D._no_weight_decay = True
         return D
 
-    def forward_core(self, x: torch.Tensor, style=None):
+    def forward_core(self, x: torch.Tensor):
         B, C, H, W = x.shape
         L = H * W
         K = 4
-
 
         x_hw = x
         x_hw[:,:,:,1::2] = torch.flip(x_hw[:,:,:,1::2], dims=[2]) #flip column
@@ -308,20 +278,7 @@ class SS2D(nn.Module):
 
         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
         
-        if style is not None:
-            style = torch.stack([style.view(B, -1, L), torch.transpose(style, dim0=2, dim1=3).contiguous().view(B, -1, L)], dim=1).view(B, 2, -1, L)
-            style = torch.cat([style, torch.flip(style, dims=[-1])], dim=1) # (1, 4, 192, 3136)
-            s_dbl = torch.einsum("b k d l, k c d -> b k c l", style.view(B, K, -1, L), self.style_proj_weight)
-            
-            if self.args != None and self.args.c_style:
-                dts, Bs = torch.split(x_dbl, [self.dt_rank, self.d_state], dim=2)
-                Cs = s_dbl
-            elif self.args != None and self.args.c_input:
-                dts, Bs = torch.split(s_dbl, [self.dt_rank, self.d_state], dim=2)
-                Cs = x_dbl
-        else:
-            dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
-        
+        dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
         
         dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
         xs = xs.float().view(B, -1, L)
@@ -332,18 +289,8 @@ class SS2D(nn.Module):
         As = -torch.exp(self.A_logs.float()).view(-1, self.d_state)
         dt_projs_bias = self.dt_projs_bias.float().view(-1) # (k * d)
         
-        if style is not None:
-            style = style.float().view(B, -1, L)
-            
-            out_y = self.selective_scan(
-            style, dts,
-            As, Bs, Cs, Ds, z=None,
-            delta_bias=dt_projs_bias,
-            delta_softplus=True,
-            return_last_state=False,
-        ).view(B, K, -1, L)
-        else:
-            out_y = self.selective_scan(
+    
+        out_y = self.selective_scan(
             xs, dts,
             As, Bs, Cs, Ds, z=None,
             delta_bias=dt_projs_bias,
@@ -368,31 +315,26 @@ class SS2D(nn.Module):
 
         return out_hw, out_wh, out_inv_hw, out_inv_wh
 
-    def forward(self, x: torch.Tensor, style=None, **kwargs):
+    def forward(self, x: torch.Tensor, **kwargs):
         B, H, W, C = x.shape
 
         xz = self.in_proj(x)
         
-        
         x, z = xz.chunk(2, dim=-1)
-        if style is not None:
-            # remove act
-            style = self.in_style_proj(style)
             
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.act(self.conv2d(x))
         
-        if style is not None:
-            style = style.permute(0, 3, 1, 2).contiguous()
-            style = self.act(self.conv2d(style))
-            y1, y2, y3, y4 = self.forward_core(x, style=style)
-        else:
-            y1, y2, y3, y4 = self.forward_core(x)
+        y1, y2, y3, y4 = self.forward_core(x)
             
         assert y1.dtype == torch.float32
-        _, weight_moe = self.moe(einops.rearrange(x, 'b d h w -> b (h w) d'))
-        y = torch.stack([y1, y2, y3, y4], dim=1)
-        y = torch.einsum("b k c l, b l k -> b c l", y, weight_moe)
+        if self.use_moe:
+            _, weight_moe = self.moe(einops.rearrange(x, 'b d h w -> b (h w) d'))
+            y = torch.stack([y1, y2, y3, y4], dim=1)
+            y = einops.rearrange(y, 'b k c h w -> b k c (h w)')
+            y = torch.einsum("b k c l, b l k -> b c l", y, weight_moe)
+        else:
+            y = y1 + y2 + y3 + y4
         
         y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
         y = self.out_norm(y)
@@ -413,53 +355,40 @@ class VSSBlock(nn.Module):
             d_state: int = 16,
             expand: float = 2.,
             is_light_sr: bool = False,
-            is_cross=False,
-            args=None,
-            use_checkpoint=False,
+            use_moe=False,
             **kwargs,
     ):
         super().__init__()
-        self.args = args
+
         self.ln_1 = norm_layer(hidden_dim)
-        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, is_cross=is_cross, args=args, **kwargs)
+        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, use_moe=use_moe, **kwargs)
         self.drop_path = DropPath(drop_path)
         self.skip_scale= nn.Parameter(torch.ones(hidden_dim))
-        # self.conv_blk = CAB(hidden_dim,is_light_sr)
-        # self.ln_2 = nn.LayerNorm(hidden_dim)
+        self.conv_blk = CAB(hidden_dim,is_light_sr)
+        self.ln_2 = nn.LayerNorm(hidden_dim)
         self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
-        self.norm = nn.LayerNorm(hidden_dim)
 
-        self.use_checkpoint = use_checkpoint
+        self.adaLN_modulation = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(hidden_dim, 6 * hidden_dim, bias=True)
+        )
 
-    def forward(self, input, style=None):
-        if self.use_checkpoint:
-            return checkpoint.checkpoint(self._forward, input, style)
-        else:
-            return  self._forward(input, style=None)
+    def forward(self, input, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        B, L, D = input.shape
 
-    def _forward(self, input, style=None):
-        # x [B,HW,C]
-        # input = rearrange(input, 'l b d -> b l d')
-        if style is not None:
-            # style = rearrange(style, 'l b d -> b l d')
-            rnd = torch.rand(style.shape[1])
-            indexes = torch.argsort(rnd)
-            
-        if self.args is not None and self.args.rnd_style:
-            style = style[:,indexes,:]
-            
-        B, L, C = input.shape
-        input = input.view(B, int(np.sqrt(L)), int(np.sqrt(L)), C).contiguous()  # [B,H,W,C]
-        if style is not None:
-            style = style.view(B, int(np.sqrt(L)), int(np.sqrt(L)), C).contiguous()  # [B,H,W,C]
-            
-        x = self.ln_1(input)
-        x = input*self.skip_scale + self.drop_path(self.self_attention(x, style=style))
-        # x = x*self.skip_scale2 + self.conv_blk(self.ln_2(x).permute(0, 3, 1, 2).contiguous()).permute(0, 2, 3, 1).contiguous()
-        x = x.view(B, -1, C).contiguous()
-        # norm here used if there's no channel attention
-        x = self.norm(x)
-        # x = rearrange(x, 'b l d -> l b d')
+        input = input.view(B, int(np.sqrt(L)), int(np.sqrt(L)), D).contiguous()  # [B,H,W,C]
+
+        x = modulate(self.ln_1(input), shift_msa, scale_msa)
+        x = input*self.skip_scale + gate_msa.unsqueeze(1).unsqueeze(1)*self.drop_path(self.self_attention(x))
+
+        #gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        x2 = modulate(self.ln_2(x), shift_mlp, scale_mlp).permute(0, 3, 1, 2).contiguous()
+        x2 = self.conv_blk(x2).permute(0, 2, 3, 1).contiguous()
+
+        x = x*self.skip_scale2 + gate_msa.unsqueeze(1).unsqueeze(1)*x2
+
+        x = x.view(B, -1, D).contiguous()
         return x
 
 

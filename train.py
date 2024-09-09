@@ -135,9 +135,10 @@ def main(args):
     model = DiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
-        args=args,
         learn_sigma=False,
         use_checkpoint=True,
+        use_mamba=args.use_mamba,
+        use_moe=args.use_moe
     )
         
     # Note that parameter initialization is done within the DiT constructor
@@ -187,6 +188,8 @@ def main(args):
   # Variables for monitoring/logging purposes:
     train_steps = 0
     log_steps = 0
+    running_loss = 0
+    start_time = time()
     try:
         accelerator.load_state()
         logger.info(f"Checkpoint found, starting from {checkpoint_file*args.ckpt_every} steps.")
@@ -201,8 +204,6 @@ def main(args):
     for epoch in range(args.epochs):
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
-            x = x
-            y = y
             with torch.no_grad():
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
 
@@ -262,7 +263,7 @@ def main(args):
                     z = torch.cat([z, z], 0)
                     y_null = torch.tensor([args.num_classes] * n, device=device)
                     y = torch.cat([y, y_null], 0)
-                    model_kwargs = dict(y=y, cfg_scale=4.0)
+                    model_kwargs = dict(y=y, cfg_scale=1.0)
 
 
                     # Sample images:
@@ -308,18 +309,17 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+
     parser.add_argument("--num-workers", type=int, default=1)
-    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--log-every", type=int, default=500)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
     parser.add_argument("--sample-every", type=int, default=10_000)
     parser.add_argument('--use_mamba', action='store_true') 
-    parser.add_argument('--c_style', action='store_true') 
-    parser.add_argument('--rnd_style', action='store_true') 
-    parser.add_argument('--c_input', action='store_true') 
+    parser.add_argument('--use_moe', action='store_true')
+
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
-    parser.add_argument("--continue_train",  action='store_true')
-    parser.add_argument("--train_steps", type=int, default=0)
+
     parser.add_argument("--use_rf", action='store_true')
     
     args = parser.parse_args()

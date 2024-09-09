@@ -104,41 +104,43 @@ class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, args=None, use_checkpoint=True, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_checkpoint=True, use_mamba=True, use_moe=False, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.args = args
-
-        if args is not None and args.use_mamba:
-            self.attn = VSSBlock(
+        self.use_mamba = use_mamba
+        if use_mamba:
+            self.vss = VSSBlock(
                 hidden_dim= hidden_size,
                 drop_path=0,
                 norm_layer=nn.LayerNorm,
                 attn_drop_rate=0,
                 d_state=16,
                 input_resolution=256,
-                is_cross=True,
-                args=args,
-                use_checkpoint=use_checkpoint)
+                use_checkpoint=use_checkpoint,
+                use_moe=use_moe,)
         else:
             self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-
-        self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
-        )
+            self.adaLN_modulation = nn.Sequential(
+                nn.SiLU(),
+                nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            )
+            self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            self.norm3 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+            
+            mlp_hidden_dim = int(hidden_size * mlp_ratio)
+            approx_gelu = lambda: nn.GELU(approximate="tanh")
+            self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+            
     def forward(self, x, c):
         return checkpoint.checkpoint(self._forward, x, c)
     
     def _forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        if self.use_mamba:
+            return self.vss(x, c)
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
     
 
@@ -146,9 +148,8 @@ class FinalLayer(nn.Module):
     """
     The final layer of DiT.
     """
-    def __init__(self, hidden_size, patch_size, out_channels, args=None):
+    def __init__(self, hidden_size, patch_size, out_channels):
         super().__init__()
-        self.args = args
         self.norm_final = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(hidden_size, patch_size * patch_size * out_channels, bias=True)
         self.adaLN_modulation = nn.Sequential(
@@ -180,16 +181,17 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
-        args=None,
-        use_checkpoint=True
+        use_checkpoint=True,
+        use_mamba = False,
+        use_moe = False,
     ):
         super().__init__()
-        self.args = args
         self.learn_sigma = learn_sigma
         self.in_channels = in_channels
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.use_mamba = use_mamba
 
         #bias = true
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size)
@@ -200,9 +202,9 @@ class DiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, args=args,use_checkpoint=use_checkpoint) for _ in range(depth)
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, use_mamba = use_mamba, use_moe = use_moe, use_checkpoint=use_checkpoint) for _ in range(depth)
         ])
-        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels, args)
+        self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -232,14 +234,16 @@ class DiT(nn.Module):
 
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
-            if self.args is not None and not self.args.use_mamba:
+            if block.use_mamba:
+                nn.init.constant_(block.vss.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.vss.adaLN_modulation[-1].bias, 0)
+            else:
                 nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
-        if self.args is not None and not self.args.use_mamba:
-            nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
@@ -352,6 +356,12 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 #################################################################################
 #                                   DiT Configs                                  #
 #################################################################################
+def DiT_XXL_1(**kwargs):
+    return DiT(depth=32, hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
+
+def DiT_XL_1(**kwargs):
+    return DiT(depth=28, hidden_size=1024, patch_size=1, num_heads=16, **kwargs)
+
 
 def DiT_XL_2(**kwargs):
     return DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
@@ -391,7 +401,8 @@ def DiT_S_8(**kwargs):
 
 
 DiT_models = {
-    'DiT-XL/2': DiT_XL_2,  'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
+    'DiT-XXL/1':DiT_XXL_1, 'DiT-XL/1': DiT_XL_1, 'DiT-XL/2': DiT_XL_2,  
+    'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
     'DiT-L/2':  DiT_L_2,   'DiT-L/4':  DiT_L_4,   'DiT-L/8':  DiT_L_8,
     'DiT-B/2':  DiT_B_2,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
     'DiT-S/2':  DiT_S_2,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
