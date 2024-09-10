@@ -362,27 +362,29 @@ class VSSBlock(nn.Module):
         self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, use_moe=use_moe, **kwargs)
         self.drop_path = DropPath(drop_path)
         self.skip_scale= nn.Parameter(torch.ones(hidden_dim))
-        self.conv_blk = CAB(hidden_dim,is_light_sr)
-        self.ln_2 = nn.LayerNorm(hidden_dim)
-        self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
+        # self.conv_blk = CAB(hidden_dim,is_light_sr)
+        # self.ln_2 = nn.LayerNorm(hidden_dim)
+        # self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
 
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(hidden_dim, 6 * hidden_dim, bias=True)
-        )
+        # self.adaLN_modulation = nn.Sequential(
+        #     nn.SiLU(),
+        #     nn.Linear(hidden_dim, 6 * hidden_dim, bias=True)
+        # )
 
-    def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+    def forward(self, x):
+        # shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         B, L, D = x.shape
 
         x = x.view(B, int(np.sqrt(L)), int(np.sqrt(L)), D).contiguous()  # [B,H,W,C]
 
-        x1 = modulate(self.ln_1(x), shift_msa, scale_msa)
-        x = x*self.skip_scale + gate_msa.unsqueeze(1).unsqueeze(1)*self.drop_path(self.self_attention(x1))
+        x = x*self.skip_scale + self.drop_path(self.self_attention(x)) # [B,H,W,C]
 
-        #gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x2 = modulate(self.ln_2(x), shift_mlp, scale_mlp).permute(0, 3, 1, 2).contiguous()
-        x = x*self.skip_scale2 + gate_mlp.unsqueeze(1).unsqueeze(1)*self.conv_blk(x2).permute(0, 2, 3, 1).contiguous()
+        # x1 = modulate(self.ln_1(x), shift_msa, scale_msa)
+        # x = x*self.skip_scale + gate_msa.unsqueeze(1).unsqueeze(1)*self.drop_path(self.self_attention(x1))
+
+        # #gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        # x2 = modulate(self.ln_2(x), shift_mlp, scale_mlp).permute(0, 3, 1, 2).contiguous()
+        # x = x*self.skip_scale2 + gate_mlp.unsqueeze(1).unsqueeze(1)*self.conv_blk(x2).permute(0, 2, 3, 1).contiguous()
 
         x = x.view(B, -1, D).contiguous()
         return x

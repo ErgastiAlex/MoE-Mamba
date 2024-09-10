@@ -36,6 +36,7 @@ from diffusion.rectified_flow import RectifiedFlow
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, set_seed
 
+from functools import partial
 
 #################################################################################
 #                             Training Helper Functions                         #
@@ -123,12 +124,13 @@ def main(args):
     except:
         checkpoint_file = 0
 
-    accelerator_project_config = ProjectConfiguration(project_dir=experiment_dir, automatic_checkpoint_naming=True, iteration = checkpoint_file+1)
+    accelerator_project_config = ProjectConfiguration(project_dir=experiment_dir, automatic_checkpoint_naming=True, iteration = checkpoint_file+1, total_limit = 3)
     accelerator = Accelerator(project_config=accelerator_project_config)
-    
+
     set_seed(args.global_seed)  # Set global seed for reproducibility
-
-
+    
+    device = accelerator.device
+    
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
@@ -138,19 +140,14 @@ def main(args):
         learn_sigma=False,
         use_checkpoint=True,
         use_mamba=args.use_mamba,
-        use_moe=args.use_moe
+        use_moe=args.use_moe,
+        learn_pos_emb = args.learn_pos_emb
     )
-        
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
-    model = model
 
-
-    if args.use_rf:
-        rectified_flow = RectifiedFlow(num_timesteps=25)
-    else:
-        diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
+    rectified_flow = RectifiedFlow(num_timesteps=25)
 
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}")
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -179,13 +176,14 @@ def main(args):
 
     # Prepare models for training:
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
-    model.train()  # important! This enables embedding dropout for classifier-free guidance
+    model.train() 
     ema.eval()  # EMA model should always be in eval mode
+
+    sample_fn = partial(rectified_flow.sample, ema.forward_with_cfg)
 
     vae, model, ema, opt, loader = accelerator.prepare(vae, model, ema, opt, loader)
 
-
-  # Variables for monitoring/logging purposes:
+    # Variables for monitoring/logging purposes:
     train_steps = 0
     log_steps = 0
     running_loss = 0
@@ -196,7 +194,6 @@ def main(args):
         train_steps = checkpoint_file*args.ckpt_every
         log_steps = train_steps % args.log_every
     except:
-        # accelerator.save_state()
         logger.info("No checkpoint found, starting from scratch.")
     
     device = accelerator.device 
@@ -208,11 +205,7 @@ def main(args):
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
 
             model_kwargs = dict(y=y)
-            if args.use_rf:
-                loss_dict = rectified_flow.training_loss(model, x, model_kwargs)
-            else:
-                t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
-                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+            loss_dict = rectified_flow.training_loss(model, x, model_kwargs)
 
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
@@ -245,41 +238,27 @@ def main(args):
             
             if train_steps % args.sample_every == 0 and train_steps > 0:
                 with torch.no_grad():
-                    model.eval()
-                    device = x.device
-
                     class_labels = [0,1,2,0,1,2,0,1]
 
                     # Create sampling noise:
                     n = len(class_labels)
-                    if args.use_rf:
-                        z = torch.randn(n, 4, latent_size, latent_size, device=device)*rectified_flow.noise_scale
-                    else:
-                        z = torch.randn(n, 4, latent_size, latent_size, device=device)
-
+                    z = torch.randn(n, 4, latent_size, latent_size, device=device)*rectified_flow.noise_scale
                     y = torch.tensor(class_labels, device=device)
 
-                    # Setup classifier-free guidance:
-                    z = torch.cat([z, z], 0)
-                    y_null = torch.tensor([args.num_classes] * n, device=device)
-                    y = torch.cat([y, y_null], 0)
-                    model_kwargs = dict(y=y, cfg_scale=1.0)
+                    y_null = torch.tensor([args.num_classes]*n).to(device)
 
+                    y = torch.cat([y, y_null], dim=0)
+                    z = torch.cat([z,z], dim=0)
+
+                    model_kwargs = dict(y=y, cfg_scale=2.0)
 
                     # Sample images:
-                    if args.use_rf:
-                        samples = rectified_flow.sample(
-                            model.forward_with_cfg, z, model_kwargs=model_kwargs, progress=True)
-                    else:
-                        samples = diffusion.p_sample_loop(
-                            model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True, device=device)
+                    samples = sample_fn(z, model_kwargs=model_kwargs, progress=True)
 
-                    samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
                     samples = vae.decode(samples / 0.18215).sample
 
                     # Save and display images:
                     save_image(samples, f"{experiment_dir}/sample_{train_steps}.png", nrow=4, normalize=True, value_range=(-1, 1))
-                    model.train()
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -312,13 +291,11 @@ if __name__ == "__main__":
 
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--log-every", type=int, default=500)
-    parser.add_argument("--ckpt-every", type=int, default=50_000)
-    parser.add_argument("--sample-every", type=int, default=10_000)
+    parser.add_argument("--ckpt-every", type=int, default=15000)
+    parser.add_argument("--sample-every", type=int, default=10000)
     parser.add_argument('--use_mamba', action='store_true') 
     parser.add_argument('--use_moe', action='store_true')
-
-    parser.add_argument("--ckpt", type=str, default=None,
-                        help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
+    parser.add_argument('--learn_pos_emb', action='store_true')
 
     parser.add_argument("--use_rf", action='store_true')
     
