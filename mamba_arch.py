@@ -21,9 +21,7 @@ class MoE(nn.Module):
     def __init__(self, hidden_dim, num_moe):
         super(MoE, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(hidden_dim, 4 * hidden_dim),
-            nn.SiLU(),
-            nn.Linear(4 * hidden_dim, num_moe),
+            nn.Linear(hidden_dim, num_moe),
         )
 
         self.soft = nn.Softmax(dim=-1)
@@ -373,20 +371,18 @@ class VSSBlock(nn.Module):
             nn.Linear(hidden_dim, 6 * hidden_dim, bias=True)
         )
 
-    def forward(self, input, c):
+    def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        B, L, D = input.shape
+        B, L, D = x.shape
 
-        input = input.view(B, int(np.sqrt(L)), int(np.sqrt(L)), D).contiguous()  # [B,H,W,C]
+        x = x.view(B, int(np.sqrt(L)), int(np.sqrt(L)), D).contiguous()  # [B,H,W,C]
 
-        x = modulate(self.ln_1(input), shift_msa, scale_msa)
-        x = input*self.skip_scale + gate_msa.unsqueeze(1).unsqueeze(1)*self.drop_path(self.self_attention(x))
+        x1 = modulate(self.ln_1(x), shift_msa, scale_msa)
+        x = x*self.skip_scale + gate_msa.unsqueeze(1).unsqueeze(1)*self.drop_path(self.self_attention(x1))
 
         #gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
         x2 = modulate(self.ln_2(x), shift_mlp, scale_mlp).permute(0, 3, 1, 2).contiguous()
-        x2 = self.conv_blk(x2).permute(0, 2, 3, 1).contiguous()
-
-        x = x*self.skip_scale2 + gate_msa.unsqueeze(1).unsqueeze(1)*x2
+        x = x*self.skip_scale2 + gate_mlp.unsqueeze(1).unsqueeze(1)*self.conv_blk(x2).permute(0, 2, 3, 1).contiguous()
 
         x = x.view(B, -1, D).contiguous()
         return x

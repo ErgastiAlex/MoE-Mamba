@@ -184,6 +184,7 @@ class DiT(nn.Module):
         use_checkpoint=True,
         use_mamba = False,
         use_moe = False,
+        learn_pos_emb = False,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -192,6 +193,7 @@ class DiT(nn.Module):
         self.patch_size = patch_size
         self.num_heads = num_heads
         self.use_mamba = use_mamba
+        self.learn_pos_emb = learn_pos_emb
 
         #bias = true
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size)
@@ -199,7 +201,7 @@ class DiT(nn.Module):
         self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=self.learn_pos_emb)
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, use_mamba = use_mamba, use_moe = use_moe, use_checkpoint=use_checkpoint) for _ in range(depth)
@@ -216,9 +218,10 @@ class DiT(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
-        # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        if self.learn_pos_emb == False:
+            # Initialize (and freeze) pos_embed by sin-cos embedding:
+            pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+            self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w = self.x_embedder.proj.weight.data
