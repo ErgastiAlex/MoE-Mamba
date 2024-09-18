@@ -138,9 +138,10 @@ def main(args):
         learn_sigma=False,
         use_checkpoint=True,
         use_mamba=args.use_mamba,
-        use_moe=args.use_moe
+        use_moe=args.use_moe,
+        learn_pos_emb=args.learn_pos_emb
     )
-        
+
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
@@ -156,7 +157,7 @@ def main(args):
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0)
 
     # Setup data:
     transform = transforms.Compose([
@@ -309,6 +310,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--learn-pos-emb", action='store_true')
 
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--log-every", type=int, default=500)
