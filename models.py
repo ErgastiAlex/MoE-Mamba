@@ -104,7 +104,7 @@ class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_checkpoint=True, use_mamba=True, use_moe=False, **block_kwargs):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_checkpoint=True, use_mamba=True, use_moe=False,number=0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.use_mamba = use_mamba
@@ -116,14 +116,16 @@ class DiTBlock(nn.Module):
                 attn_drop_rate=0,
                 d_state=16,
                 input_resolution=256,
-                use_checkpoint=use_checkpoint,
-                use_moe=use_moe,)
+                use_moe=use_moe,
+                number=number)
         else:
             self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         
+        self.use_checkpoint = use_checkpoint
+        adaln_number = 3 if self.use_mamba else 6
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(hidden_size, 6 * hidden_size, bias=True)
+            nn.Linear(hidden_size, adaln_number * hidden_size, bias=True)
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
             
@@ -132,12 +134,20 @@ class DiTBlock(nn.Module):
         self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
             
     def forward(self, x, c):
-        return checkpoint.checkpoint(self._forward, x, c)
+        if self.use_checkpoint:
+            return checkpoint.checkpoint(self._forward, x, c)
+        else:
+            return self._forward(x, c)
     
     def _forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+        if self.use_mamba:
+            shift_msa, scale_msa, gate_msa = self.adaLN_modulation(c).chunk(3, dim=1)
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
         x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        
+        if not self.use_mamba:
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
     
 
@@ -191,17 +201,27 @@ class DiT(nn.Module):
         self.num_heads = num_heads
         self.use_mamba = use_mamba
         self.learn_pos_emb = learn_pos_emb
+        self.num_classes = num_classes
 
         #bias = true
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
-        self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        
+        if self.num_classes != 0:
+            self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
+        
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=self.learn_pos_emb)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio, use_mamba = use_mamba, use_moe = use_moe, use_checkpoint=use_checkpoint) for _ in range(depth)
+            DiTBlock(hidden_size, 
+                    num_heads, 
+                    mlp_ratio=mlp_ratio, 
+                    use_mamba = use_mamba, 
+                    use_moe = use_moe, 
+                    use_checkpoint=use_checkpoint,
+                    number=i) for i in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
@@ -226,7 +246,8 @@ class DiT(nn.Module):
         nn.init.constant_(self.x_embedder.proj.bias, 0)
 
         # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
+        if self.num_classes != 0:
+            nn.init.normal_(self.y_embedder.embedding_table.weight, std=0.02)
 
         # Initialize timestep embedding MLP:
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -267,8 +288,10 @@ class DiT(nn.Module):
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
-        y = self.y_embedder(y, self.training)    # (N, D)
-        c = t + y                                # (N, D)
+        if self.num_classes != 0:
+            y = self.y_embedder(y, self.training)    # (N, D)
+            c = t + y                                # (N, D)
+        c = t
         for block in self.blocks:
             x = block(x, c)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
@@ -280,6 +303,7 @@ class DiT(nn.Module):
         Forward pass of DiT, but also batches the unconditional forward pass for classifier-free guidance.
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
+        assert self.num_classes != 0, "Forward with cfg requires class labels."
         print("half_eps", x.shape, flush=True)
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
@@ -353,54 +377,22 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 #################################################################################
 #                                   DiT Configs                                  #
 #################################################################################
-def DiT_XXL_1(**kwargs):
-    return DiT(depth=32, hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
 
 def DiT_XL_1(**kwargs):
-    return DiT(depth=28, hidden_size=1024, patch_size=1, num_heads=16, **kwargs)
+    return DiT(depth=56, hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
 
+def DiT_L_1(**kwargs):
+    return DiT(depth=48, hidden_size=1024, patch_size=1, num_heads=16, **kwargs)
 
-def DiT_XL_2(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=2, num_heads=16, **kwargs)
+def DiT_B_1(**kwargs):
+    return DiT(depth=24, hidden_size=768, patch_size=1, num_heads=16, **kwargs)
 
-def DiT_XL_4(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=4, num_heads=16, **kwargs)
-
-def DiT_XL_8(**kwargs):
-    return DiT(depth=28, hidden_size=1152, patch_size=8, num_heads=16, **kwargs)
-
-def DiT_L_2(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=2, num_heads=16, **kwargs)
-
-def DiT_L_4(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=4, num_heads=16, **kwargs)
-
-def DiT_L_8(**kwargs):
-    return DiT(depth=24, hidden_size=1024, patch_size=8, num_heads=16, **kwargs)
-
-def DiT_B_2(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=2, num_heads=12, **kwargs)
-
-def DiT_B_4(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=4, num_heads=12, **kwargs)
-
-def DiT_B_8(**kwargs):
-    return DiT(depth=12, hidden_size=768, patch_size=8, num_heads=12, **kwargs)
-
-def DiT_S_2(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=2, num_heads=6, **kwargs)
-
-def DiT_S_4(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=4, num_heads=6, **kwargs)
-
-def DiT_S_8(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=8, num_heads=6, **kwargs)
-
+def DiT_S_1(**kwargs):
+    return DiT(depth=12, hidden_size=384, patch_size=1, num_heads=16, **kwargs)
 
 DiT_models = {
-    'DiT-XXL/1':DiT_XXL_1, 'DiT-XL/1': DiT_XL_1, 'DiT-XL/2': DiT_XL_2,  
-    'DiT-XL/4': DiT_XL_4,  'DiT-XL/8': DiT_XL_8,
-    'DiT-L/2':  DiT_L_2,   'DiT-L/4':  DiT_L_4,   'DiT-L/8':  DiT_L_8,
-    'DiT-B/2':  DiT_B_2,   'DiT-B/4':  DiT_B_4,   'DiT-B/8':  DiT_B_8,
-    'DiT-S/2':  DiT_S_2,   'DiT-S/4':  DiT_S_4,   'DiT-S/8':  DiT_S_8,
+    'DiT-XL/1': DiT_XL_1,
+    'DiT-L/1': DiT_L_1,
+    'DiT-B/1': DiT_B_1,
+    'DiT-S/1': DiT_S_1,
 }

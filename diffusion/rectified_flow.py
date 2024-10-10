@@ -1,7 +1,7 @@
 import torch
 from tqdm import tqdm
 class RectifiedFlow():
-    def __init__(self, num_timesteps, noise_scale=1.0, init_type='gaussian', eps=1):
+    def __init__(self, num_timesteps, noise_scale=1.0, init_type='gaussian', eps=1, sampling="log"):
         """
         eps: A `float` number. The smallest time step to sample from.
         """
@@ -9,12 +9,15 @@ class RectifiedFlow():
         self.T = 1000.
         self.noise_scale = noise_scale
         self.init_type = init_type
-        self.eps = 1. 
+        self.eps = eps
+        self.sampling = sampling
 
     def training_loss(self, model, x, model_kwargs):
-        normal = torch.randn(x.shape[0], device=x.device)
-        t = torch.sigmoid(normal) *(self.T-self.eps) + self.eps
-        # t = torch.rand(x.shape[0], device=x.device)
+        if self.sampling == "log":
+            normal = torch.randn(x.shape[0], device=x.device)
+            t = torch.sigmoid(normal) *(self.T-self.eps) + self.eps
+        elif self.sampling == "uniform":
+            t = torch.rand(x.shape[0], device=x.device)
 
         z0 = self.get_z0(x).to(x.device)
 

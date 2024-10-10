@@ -26,6 +26,7 @@ import argparse
 import logging
 import os
 from download import find_model
+from my_metric import MyMetric
 
 from models import DiT_models
 from diffusion import create_diffusion
@@ -41,6 +42,11 @@ from functools import partial
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
+
+def out2img(samples):
+    return torch.clamp(127.5 * samples + 128.0, 0, 255).to(
+        dtype=torch.uint8, device="cuda"
+    )
 
 @torch.no_grad()
 def update_ema(ema_model, model, decay=0.9999):
@@ -138,7 +144,7 @@ def main(args):
         input_size=latent_size,
         num_classes=args.num_classes,
         learn_sigma=False,
-        use_checkpoint=True,
+        use_checkpoint=args.use_ckpt,
         use_mamba=args.use_mamba,
         use_moe=args.use_moe,
         learn_pos_emb = args.learn_pos_emb
@@ -147,7 +153,7 @@ def main(args):
     ema = deepcopy(model)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
 
-    rectified_flow = RectifiedFlow(num_timesteps=25)
+    rectified_flow = RectifiedFlow(num_timesteps=25, sampling=args.sampling)
 
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}")
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
@@ -162,32 +168,50 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-    dataset = ImageFolder(args.data_path, transform=transform)
+    train_dataset = ImageFolder(os.path.join(args.data_path,"train"), transform=transform)
+    test_dataset = ImageFolder(os.path.join(args.data_path,"val"), transform=transform)
 
     loader = DataLoader(
-        dataset,
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True
+    )
+
+    test_loader = DataLoader(
+        test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=True,
         drop_last=True
     )
-    logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+
+    logger.info(f"Train dataset contains {len(train_dataset)}")
+    logger.info(f"Test dataset contains {len(test_dataset)}")
 
     # Prepare models for training:
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
     model.train() 
     ema.eval()  # EMA model should always be in eval mode
 
-    sample_fn = partial(rectified_flow.sample, ema.forward_with_cfg)
+    if args.num_classes != 0:
+        sample_fn = partial(rectified_flow.sample, ema.forward_with_cfg)
+    else:
+        sample_fn = partial(rectified_flow.sample, ema.forward)
 
-    vae, model, ema, opt, loader = accelerator.prepare(vae, model, ema, opt, loader)
+    model, ema, opt, loader, test_loader = accelerator.prepare(model, ema, opt, loader, test_loader)
 
+    vae.to(device)
+    
     # Variables for monitoring/logging purposes:
     train_steps = 0
     log_steps = 0
     running_loss = 0
     start_time = time()
+
     try:
         accelerator.load_state()
         logger.info(f"Checkpoint found, starting from {checkpoint_file*args.ckpt_every} steps.")
@@ -198,9 +222,18 @@ def main(args):
     
     device = accelerator.device 
 
+    my_metrics = MyMetric()
+    best_fid = 1e9
     for epoch in range(args.epochs):
         logger.info(f"Beginning epoch {epoch}...")
+
+        if train_steps >= 500000:
+            break
+
         for x, y in loader:
+            if train_steps >= 500000:
+                break
+
             with torch.no_grad():
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
 
@@ -238,27 +271,51 @@ def main(args):
             
             if train_steps % args.sample_every == 0 and train_steps > 0:
                 with torch.no_grad():
-                    class_labels = [0,1,2,0,1,2,0,1]
+                    my_metrics.reset()
+                    for x, y in test_loader:
+                        # Create sampling noise:
+                        n = x.shape[0]
+                        z = torch.randn(n, 4, latent_size, latent_size, device=device)*rectified_flow.noise_scale
 
-                    # Create sampling noise:
-                    n = len(class_labels)
-                    z = torch.randn(n, 4, latent_size, latent_size, device=device)*rectified_flow.noise_scale
-                    y = torch.tensor(class_labels, device=device)
+                        y_null = torch.tensor([args.num_classes]*n).to(device)
 
-                    y_null = torch.tensor([args.num_classes]*n).to(device)
+                        y = torch.cat([y, y_null], dim=0)
+                        z = torch.cat([z,z], dim=0)
 
-                    y = torch.cat([y, y_null], dim=0)
-                    z = torch.cat([z,z], dim=0)
+                        if args.num_classes != 0:
+                            model_kwargs = dict(y=y, cfg_scale=2.0)
+                        else:
+                            model_kwargs = dict(y=y)
 
-                    model_kwargs = dict(y=y, cfg_scale=2.0)
+                        # Sample images:
+                        samples = sample_fn(z, model_kwargs=model_kwargs, progress=False)
 
-                    # Sample images:
-                    samples = sample_fn(z, model_kwargs=model_kwargs, progress=True)
+                        samples = vae.decode(samples / 0.18215).sample
+                        samples, _ = torch.chunk(samples, 2, dim=0)
 
-                    samples = vae.decode(samples / 0.18215).sample
+                        x = out2img(x)
+                        samples = out2img(samples)
 
-                    # Save and display images:
-                    save_image(samples, f"{experiment_dir}/sample_{train_steps}.png", nrow=4, normalize=True, value_range=(-1, 1))
+
+                        my_metrics.update_real(x)
+                        my_metrics.update_fake(samples)
+
+                    _metric_dict = my_metrics.compute()
+                    fid = _metric_dict["fid"]
+                    _metric_dict = {f"eval/{k}": v for k, v in _metric_dict.items()}
+                    logger.info(f"Eval FID at steps {train_steps}: {fid:.4f}, Best FID: {best_fid:.4f}")
+                    
+                    if fid < best_fid:
+                        checkpoint_path = f"{experiment_dir}/best_{train_steps}.pt"
+                        accelerator.save({
+                            "model": accelerator.unwrap_model(model).state_dict(),
+                            "ema": accelerator.unwrap_model(ema).state_dict(),
+                            "opt": opt.optimizer.state_dict(),
+                            "args": args
+                        }, checkpoint_path)
+                        
+                    best_fid = min(fid, best_fid)
+
 
     model.eval()  # important! This disables randomized embedding dropout
     # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
@@ -296,8 +353,8 @@ if __name__ == "__main__":
     parser.add_argument('--use_mamba', action='store_true') 
     parser.add_argument('--use_moe', action='store_true')
     parser.add_argument('--learn_pos_emb', action='store_true')
+    parser.add_argument('--use_ckpt', action='store_true')
 
-    parser.add_argument("--use_rf", action='store_true')
-    
+    parser.add_argument("--sampling", type=str, choices=["log", "uniform"], default="log")
     args = parser.parse_args()
     main(args)

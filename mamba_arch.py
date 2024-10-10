@@ -25,6 +25,9 @@ class MoE(nn.Module):
         )
 
         self.soft = nn.Softmax(dim=-1)
+
+        #TODO: Inizializzare linear con 0 per fare si che all'inizio il peso sia 1/4 per ogni testa
+        
     
     def forward(self, x):
         logits = self.net(x)
@@ -140,6 +143,7 @@ class SS2D(nn.Module):
             device=None,
             dtype=None,
             use_moe=False,
+            number=0,
             **kwargs,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -151,7 +155,7 @@ class SS2D(nn.Module):
         self.expand = expand
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
-
+        self.number=number
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
         self.conv2d = nn.Conv2d(
             in_channels=self.d_inner,
@@ -263,16 +267,28 @@ class SS2D(nn.Module):
         L = H * W
         K = 4
 
-        x_hw = x
-        x_hw[:,:,:,1::2] = torch.flip(x_hw[:,:,:,1::2], dims=[2]) #flip column
+        if self.number%2==0:
+            x_hw = x
+            x_hw[:,:,:,1::2] = torch.flip(x_hw[:,:,:,1::2], dims=[2]) #flip column
 
-        x_wh = x
-        x_wh[:,:,1::2,:] = torch.flip(x_wh[:,:,1::2,:], dims=[3]) #flip row
-        x_wh = torch.transpose(x_wh, dim0=2, dim1=3)
+            x_wh = x
+            x_wh[:,:,1::2,:] = torch.flip(x_wh[:,:,1::2,:], dims=[3]) #flip row
+            x_wh = torch.transpose(x_wh, dim0=2, dim1=3)
 
-        x_hwwh = torch.stack([x_hw,x_wh], dim=1).view(B, 2, -1, L)
+            x_hwwh = torch.stack([x_hw,x_wh], dim=1).view(B, 2, -1, L)
 
-        xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
+            xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
+        else:
+            x_hw = x
+            x_hw[:,:,:,0::2] = torch.flip(x_hw[:,:,:,0::2], dims=[2]) #flip column
+
+            x_wh = x
+            x_wh[:,:,0::2,:] = torch.flip(x_wh[:,:,0::2,:], dims=[3]) #flip row
+            x_wh = torch.transpose(x_wh, dim0=2, dim1=3)
+
+            x_hwwh = torch.stack([x_hw,x_wh], dim=1).view(B, 2, -1, L)
+
+            xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
 
         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
         
@@ -295,21 +311,37 @@ class SS2D(nn.Module):
             delta_softplus=True,
             return_last_state=False,
         ).view(B, K, -1, L)
-            
-        out_hw = out_y[:, 0].view(B, -1, H, W)
-        out_hw[:,:,:,1::2] = torch.flip(out_hw[:,:,:,1::2], dims=[2]) #flip column
+        
+        if self.number%2==0:
+            out_hw = out_y[:, 0].view(B, -1, H, W)
+            out_hw[:,:,:,1::2] = torch.flip(out_hw[:,:,:,1::2], dims=[2]) #flip column
 
-        out_wh = out_y[:, 1].view(B, -1, W, H)
-        out_wh = torch.transpose(out_wh, dim0=2, dim1=3)
-        out_wh[:,:,1::2,:] = torch.flip(out_wh[:,:,1::2,:], dims=[3]) #flip row
+            out_wh = out_y[:, 1].view(B, -1, W, H)
+            out_wh = torch.transpose(out_wh, dim0=2, dim1=3)
+            out_wh[:,:,1::2,:] = torch.flip(out_wh[:,:,1::2,:], dims=[3]) #flip row
 
-        out_inv = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
-        out_inv_hw = out_inv[:, 0].view(B, -1, H, W)
-        out_inv_hw[:,:,:,1::2] = torch.flip(out_inv_hw[:,:,:,1::2], dims=[2]) #flip column
+            out_inv = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
+            out_inv_hw = out_inv[:, 0].view(B, -1, H, W)
+            out_inv_hw[:,:,:,1::2] = torch.flip(out_inv_hw[:,:,:,1::2], dims=[2]) #flip column
 
-        out_inv_wh = out_inv[:, 1].view(B, -1, W, H)
-        out_inv_wh = torch.transpose(out_inv_wh, dim0=2, dim1=3)
-        out_inv_wh[:,:,1::2,:] = torch.flip(out_inv_wh[:,:,1::2,:], dims=[3]) #flip row
+            out_inv_wh = out_inv[:, 1].view(B, -1, W, H)
+            out_inv_wh = torch.transpose(out_inv_wh, dim0=2, dim1=3)
+            out_inv_wh[:,:,1::2,:] = torch.flip(out_inv_wh[:,:,1::2,:], dims=[3]) #flip row
+        else:
+            out_hw = out_y[:, 0].view(B, -1, H, W)
+            out_hw[:,:,:,0::2] = torch.flip(out_hw[:,:,:,0::2], dims=[2]) #flip column
+
+            out_wh = out_y[:, 1].view(B, -1, W, H)
+            out_wh = torch.transpose(out_wh, dim0=2, dim1=3)
+            out_wh[:,:,0::2,:] = torch.flip(out_wh[:,:,0::2,:], dims=[3]) #flip row
+
+            out_inv = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
+            out_inv_hw = out_inv[:, 0].view(B, -1, H, W)
+            out_inv_hw[:,:,:,0::2] = torch.flip(out_inv_hw[:,:,:,0::2], dims=[2]) #flip column
+
+            out_inv_wh = out_inv[:, 1].view(B, -1, W, H)
+            out_inv_wh = torch.transpose(out_inv_wh, dim0=2, dim1=3)
+            out_inv_wh[:,:,0::2,:] = torch.flip(out_inv_wh[:,:,0::2,:], dims=[3]) #flip row
 
         return out_hw, out_wh, out_inv_hw, out_inv_wh
 
@@ -354,12 +386,13 @@ class VSSBlock(nn.Module):
             expand: float = 2.,
             is_light_sr: bool = False,
             use_moe=False,
+            number=0,
             **kwargs,
     ):
         super().__init__()
 
         self.ln_1 = norm_layer(hidden_dim)
-        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, use_moe=use_moe, **kwargs)
+        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, use_moe=use_moe, number=number,**kwargs)
         self.drop_path = DropPath(drop_path)
         self.skip_scale= nn.Parameter(torch.ones(hidden_dim))
         # self.conv_blk = CAB(hidden_dim,is_light_sr)
