@@ -104,7 +104,16 @@ class DiTBlock(nn.Module):
     """
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, use_checkpoint=True, use_mamba=True, use_moe=False,number=0, **block_kwargs):
+    def __init__(self, hidden_size, 
+                       num_heads, 
+                       mlp_ratio=4.0, 
+                       use_checkpoint=True, 
+                       use_mamba=True, 
+                       use_moe=False, 
+                       use_weighted=False,
+                       number=0, 
+                       num_scans=4,
+                       **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.use_mamba = use_mamba
@@ -117,9 +126,14 @@ class DiTBlock(nn.Module):
                 d_state=16,
                 input_resolution=256,
                 use_moe=use_moe,
-                number=number)
+                use_weighted=use_weighted,
+                number=number,
+                num_scans=num_scans)
         else:
             self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+            mlp_hidden_dim = int(hidden_size * mlp_ratio)
+            approx_gelu = lambda: nn.GELU(approximate="tanh")
+            self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         
         self.use_checkpoint = use_checkpoint
         adaln_number = 3 if self.use_mamba else 6
@@ -129,9 +143,6 @@ class DiTBlock(nn.Module):
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
             
-        mlp_hidden_dim = int(hidden_size * mlp_ratio)
-        approx_gelu = lambda: nn.GELU(approximate="tanh")
-        self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
             
     def forward(self, x, c):
         if self.use_checkpoint:
@@ -191,7 +202,9 @@ class DiT(nn.Module):
         use_checkpoint=True,
         use_mamba = False,
         use_moe = False,
+        use_weighted = False,
         learn_pos_emb = False,
+        num_scans = 4,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -220,8 +233,10 @@ class DiT(nn.Module):
                     mlp_ratio=mlp_ratio, 
                     use_mamba = use_mamba, 
                     use_moe = use_moe, 
+                    use_weighted = use_weighted,
                     use_checkpoint=use_checkpoint,
-                    number=i) for i in range(depth)
+                    number=i,
+                    num_scans=num_scans) for i in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
@@ -304,7 +319,6 @@ class DiT(nn.Module):
         """
         # https://github.com/openai/glide-text2im/blob/main/notebooks/text2im.ipynb
         assert self.num_classes != 0, "Forward with cfg requires class labels."
-        print("half_eps", x.shape, flush=True)
         half = x[: len(x) // 2]
         combined = torch.cat([half, half], dim=0)
         model_out = self.forward(combined, t, y)
@@ -315,7 +329,6 @@ class DiT(nn.Module):
         # eps, rest = model_out[:, :3], model_out[:, 3:]
         cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
         half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
-        print("half_eps", half_eps.shape, flush=True)
         return torch.cat([half_eps,half_eps], dim=0)
 
 

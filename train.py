@@ -147,8 +147,9 @@ def main(args):
         use_checkpoint=args.use_ckpt,
         use_mamba=args.use_mamba,
         use_moe=args.use_moe,
-        learn_pos_emb = args.learn_pos_emb
-    )
+        use_weighted=args.use_weighted,
+        learn_pos_emb = args.learn_pos_emb,
+        num_scans=args.num_scans)
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
@@ -341,6 +342,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=2)
+    parser.add_argument("--num_scans", type=int, default=4, choices=[2, 4])
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-seed", type=int, default=0)
@@ -352,6 +354,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample-every", type=int, default=10000)
     parser.add_argument('--use_mamba', action='store_true') 
     parser.add_argument('--use_moe', action='store_true')
+    parser.add_argument('--use_weighted', action='store_true')
     parser.add_argument('--learn_pos_emb', action='store_true')
     parser.add_argument('--use_ckpt', action='store_true')
 

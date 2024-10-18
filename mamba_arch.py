@@ -34,95 +34,6 @@ class MoE(nn.Module):
         
         return logits, self.soft(logits)
 
-class ChannelAttention(nn.Module):
-    """Channel attention used in RCAN.
-    Args:
-        num_feat (int): Channel number of intermediate features.
-        squeeze_factor (int): Channel squeeze factor. Default: 16.
-    """
-
-    def __init__(self, num_feat, squeeze_factor=16):
-        super(ChannelAttention, self).__init__()
-        self.attention = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(num_feat, num_feat // squeeze_factor, 1, padding=0),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(num_feat // squeeze_factor, num_feat, 1, padding=0),
-            nn.Sigmoid())
-
-    def forward(self, x):
-        y = self.attention(x)
-        return x * y
-
-
-class CAB(nn.Module):
-    def __init__(self, num_feat, is_light_sr= False, compress_ratio=3,squeeze_factor=30):
-        super(CAB, self).__init__()
-        if is_light_sr: # a larger compression ratio is used for light-SR
-            compress_ratio = 6
-        self.cab = nn.Sequential(
-            nn.Conv2d(num_feat, num_feat // compress_ratio, 3, 1, 1),
-            nn.GELU(),
-            nn.Conv2d(num_feat // compress_ratio, num_feat, 3, 1, 1),
-            ChannelAttention(num_feat, squeeze_factor)
-        )
-
-    def forward(self, x):
-        return self.cab(x)
-
-
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-
-
-class DynamicPosBias(nn.Module):
-    def __init__(self, dim, num_heads):
-        super().__init__()
-        self.num_heads = num_heads
-        self.pos_dim = dim // 4
-        self.pos_proj = nn.Linear(2, self.pos_dim)
-        self.pos1 = nn.Sequential(
-            nn.LayerNorm(self.pos_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.pos_dim, self.pos_dim),
-        )
-        self.pos2 = nn.Sequential(
-            nn.LayerNorm(self.pos_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.pos_dim, self.pos_dim)
-        )
-        self.pos3 = nn.Sequential(
-            nn.LayerNorm(self.pos_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(self.pos_dim, self.num_heads)
-        )
-
-    def forward(self, biases):
-        pos = self.pos3(self.pos2(self.pos1(self.pos_proj(biases))))
-        return pos
-
-    def flops(self, N):
-        flops = N * 2 * self.pos_dim
-        flops += N * self.pos_dim * self.pos_dim
-        flops += N * self.pos_dim * self.pos_dim
-        flops += N * self.pos_dim * self.num_heads
-        return flops
-
 
 class SS2D(nn.Module):
     def __init__(
@@ -143,12 +54,18 @@ class SS2D(nn.Module):
             device=None,
             dtype=None,
             use_moe=False,
+            use_weighted=False,
             number=0,
+            num_scans=4,
             **kwargs,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
+        
+        assert not (use_moe and use_weighted), "Cannot use both MoE and weighted sum"
+
         self.use_moe = use_moe
+        self.use_weighted = use_weighted
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
@@ -156,6 +73,8 @@ class SS2D(nn.Module):
         self.d_inner = int(self.expand * self.d_model)
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.number=number
+        self.num_scans=num_scans
+
         self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
         self.conv2d = nn.Conv2d(
             in_channels=self.d_inner,
@@ -166,34 +85,25 @@ class SS2D(nn.Module):
             padding=(d_conv - 1) // 2,
             **factory_kwargs,
         )
+
         self.act = nn.SiLU()
 
-        self.x_proj = (
-                nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
-                nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
-                nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
-                nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs),
-        )
+        self.x_proj = list([
+                nn.Linear(self.d_inner, (self.dt_rank + self.d_state * 2), bias=False, **factory_kwargs) for _ in range(num_scans)
+        ])
         
         self.x_proj_weight = nn.Parameter(torch.stack([t.weight for t in self.x_proj], dim=0))  # (K=4, N, inner)
         del self.x_proj
 
-        self.dt_projs = (
-            self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
-                         **factory_kwargs),
-            self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
-                         **factory_kwargs),
-            self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
-                         **factory_kwargs),
-            self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor,
-                         **factory_kwargs),
-        )
+        self.dt_projs = list([
+            self.dt_init(self.dt_rank, self.d_inner, dt_scale, dt_init, dt_min, dt_max, dt_init_floor, **factory_kwargs) for _ in range(num_scans)
+        ])
         self.dt_projs_weight = nn.Parameter(torch.stack([t.weight for t in self.dt_projs], dim=0))  # (K=4, inner, rank)
         self.dt_projs_bias = nn.Parameter(torch.stack([t.bias for t in self.dt_projs], dim=0))  # (K=4, inner)
         del self.dt_projs
 
-        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=4, merge=True)  # (K=4, D, N)
-        self.Ds = self.D_init(self.d_inner, copies=4, merge=True)  # (K=4, D, N)
+        self.A_logs = self.A_log_init(self.d_state, self.d_inner, copies=self.num_scans, merge=True)  # (K=4, D, N)
+        self.Ds = self.D_init(self.d_inner, copies=self.num_scans, merge=True)  # (K=4, D, N)
 
         self.selective_scan = selective_scan_fn
 
@@ -202,8 +112,10 @@ class SS2D(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
 
         if self.use_moe:
-            self.moe = MoE(self.d_inner, 4)
-
+            self.moe = MoE(self.d_inner, self.num_scans)
+        
+        if self.use_weighted:
+            self.weight = nn.Parameter(torch.zeros(self.num_scans))
 
     @staticmethod
     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
@@ -262,33 +174,59 @@ class SS2D(nn.Module):
         D._no_weight_decay = True
         return D
 
+    def get_horizontal_scan1(self, x):
+        x[:,:,:,1::2] = torch.flip(x[:,:,:,1::2], dims=[2]) #flip column
+        return x
+
+    def get_horizontal_scan2(self, x):
+        x[:,:,:,0::2] = torch.flip(x[:,:,:,0::2], dims=[2]) #flip column
+        return x
+
+    def get_vertical_scan1(self, x):
+        x[:,:,1::2,:] = torch.flip(x[:,:,1::2,:], dims=[3]) #flip row
+        x = torch.transpose(x, dim0=2, dim1=3)
+        return x
+    
+    def get_vertical_scan2(self, x):
+        x[:,:,0::2,:] = torch.flip(x[:,:,0::2,:], dims=[3])
+        x = torch.transpose(x, dim0=2, dim1=3)
+        return x
     def forward_core(self, x: torch.Tensor):
         B, C, H, W = x.shape
         L = H * W
-        K = 4
+        K = self.num_scans
 
-        if self.number%2==0:
-            x_hw = x
-            x_hw[:,:,:,1::2] = torch.flip(x_hw[:,:,:,1::2], dims=[2]) #flip column
+        if self.use_moe:
+            _, weight_moe = self.moe(einops.rearrange(x, 'b d h w -> b (h w) d'))
 
-            x_wh = x
-            x_wh[:,:,1::2,:] = torch.flip(x_wh[:,:,1::2,:], dims=[3]) #flip row
-            x_wh = torch.transpose(x_wh, dim0=2, dim1=3)
+        if self.num_scans == 2:
+            if self.number % 4 == 0:
+                x_hw = self.get_horizontal_scan1(x)
+                xs = torch.cat([x_hw, torch.flip(x_hw, dims=[-1])], dim=1) # (1, 2, 192, 3136)
+            elif self.number % 4 == 1:
+                x_hw = self.get_horizontal_scan2(x)
+                xs = torch.cat([x_hw, torch.flip(x_hw, dims=[-1])], dim=1) # (1, 2, 192, 3136)
+            elif self.number % 4 == 2:
+                x_wh = self.get_vertical_scan1(x)
+                xs = torch.cat([x_wh, torch.flip(x_wh, dims=[-1])], dim=1)
+            elif self.number % 4 == 3:
+                x_wh = self.get_vertical_scan2(x)
+                xs = torch.cat([x_wh, torch.flip(x_wh, dims=[-1])], dim=1)
 
-            x_hwwh = torch.stack([x_hw,x_wh], dim=1).view(B, 2, -1, L)
-
-            xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
-        else:
-            x_hw = x
-            x_hw[:,:,:,0::2] = torch.flip(x_hw[:,:,:,0::2], dims=[2]) #flip column
-
-            x_wh = x
-            x_wh[:,:,0::2,:] = torch.flip(x_wh[:,:,0::2,:], dims=[3]) #flip row
-            x_wh = torch.transpose(x_wh, dim0=2, dim1=3)
-
-            x_hwwh = torch.stack([x_hw,x_wh], dim=1).view(B, 2, -1, L)
-
-            xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
+        elif self.num_scans == 4:
+            if self.number%2==0:
+                x_hw = self.get_horizontal_scan1(x)
+                x_wh = self.get_vertical_scan1(x)
+                x_hwwh = torch.stack([x_hw,x_wh], dim=1).view(B, 2, -1, L)
+                xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
+            else:
+                x_hw = self.get_horizontal_scan2(x)
+                x_wh = self.get_vertical_scan2(x)
+                x_hwwh = torch.stack([x_hw,x_wh], dim=1).view(B, 2, -1, L)
+                xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
+        elif self.num_scans == 8:
+            raise NotImplementedError
+        
 
         x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
         
@@ -311,39 +249,98 @@ class SS2D(nn.Module):
             delta_softplus=True,
             return_last_state=False,
         ).view(B, K, -1, L)
-        
-        if self.number%2==0:
-            out_hw = out_y[:, 0].view(B, -1, H, W)
-            out_hw[:,:,:,1::2] = torch.flip(out_hw[:,:,:,1::2], dims=[2]) #flip column
 
-            out_wh = out_y[:, 1].view(B, -1, W, H)
-            out_wh = torch.transpose(out_wh, dim0=2, dim1=3)
-            out_wh[:,:,1::2,:] = torch.flip(out_wh[:,:,1::2,:], dims=[3]) #flip row
+        if self.num_scans == 2:
+            if self.number % 4 == 0:
+                out_hw = out_y[:, 0].view(B, -1, H, W)
+                out_hw[:,:,:,1::2] = torch.flip(out_hw[:,:,:,1::2], dims=[2]) #flip column
 
-            out_inv = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
-            out_inv_hw = out_inv[:, 0].view(B, -1, H, W)
-            out_inv_hw[:,:,:,1::2] = torch.flip(out_inv_hw[:,:,:,1::2], dims=[2]) #flip column
+                out_inv_hw = torch.flip(out_y[:, 1], dims=[-1]).view(B, -1, H, W)
+                out_inv_hw[:,:,:,1::2] = torch.flip(out_inv_hw[:,:,:,1::2], dims=[2]) #flip column
 
-            out_inv_wh = out_inv[:, 1].view(B, -1, W, H)
-            out_inv_wh = torch.transpose(out_inv_wh, dim0=2, dim1=3)
-            out_inv_wh[:,:,1::2,:] = torch.flip(out_inv_wh[:,:,1::2,:], dims=[3]) #flip row
+                y = [out_hw, out_inv_hw]
+
+            elif self.number % 4 == 1:
+                out_hw = out_y[:, 0].view(B, -1, H, W)
+                out_hw[:,:,:,0::2] = torch.flip(out_hw[:,:,:,0::2], dims=[2])
+
+                out_inv_hw = torch.flip(out_y[:, 1], dims=[-1]).view(B, -1, H, W)
+                out_inv_hw[:,:,:,0::2] = torch.flip(out_inv_hw[:,:,:,0::2], dims=[2])
+
+                y = [out_hw, out_inv_hw]
+            
+            elif self.number % 4 == 2:
+                out_wh = out_y[:, 0].view(B, -1, W, H)
+                out_wh = torch.transpose(out_wh, dim0=2, dim1=3)
+                out_wh[:,:,1::2,:] = torch.flip(out_wh[:,:,1::2,:], dims=[3])
+
+                out_inv_wh = torch.flip(out_y[:, 1], dims=[-1]).view(B, -1, W, H)
+                out_inv_wh = torch.transpose(out_inv_wh, dim0=2, dim1=3)
+                out_inv_wh[:,:,1::2,:] = torch.flip(out_inv_wh[:,:,1::2,:], dims=[3])
+
+                y = [out_wh, out_inv_wh]
+            
+            elif self.number % 4 == 3:
+                out_wh = out_y[:, 0].view(B, -1, W, H)
+                out_wh = torch.transpose(out_wh, dim0=2, dim1=3)
+                out_wh[:,:,0::2,:] = torch.flip(out_wh[:,:,0::2,:], dims=[3])
+
+                out_inv_wh = torch.flip(out_y[:, 1], dims=[-1]).view(B, -1, W, H)
+                out_inv_wh = torch.transpose(out_inv_wh, dim0=2, dim1=3)
+                out_inv_wh[:,:,0::2,:] = torch.flip(out_inv_wh[:,:,0::2,:], dims=[3])
+
+                y = [out_wh, out_inv_wh]
+        elif self.num_scans == 4:
+            if self.number%2==0:
+                out_hw = out_y[:, 0].view(B, -1, H, W)
+                out_hw[:,:,:,1::2] = torch.flip(out_hw[:,:,:,1::2], dims=[2]) #flip column
+
+                out_wh = out_y[:, 1].view(B, -1, W, H)
+                out_wh = torch.transpose(out_wh, dim0=2, dim1=3)
+                out_wh[:,:,1::2,:] = torch.flip(out_wh[:,:,1::2,:], dims=[3]) #flip row
+
+                out_inv = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
+                out_inv_hw = out_inv[:, 0].view(B, -1, H, W)
+                out_inv_hw[:,:,:,1::2] = torch.flip(out_inv_hw[:,:,:,1::2], dims=[2]) #flip column
+
+                out_inv_wh = out_inv[:, 1].view(B, -1, W, H)
+                out_inv_wh = torch.transpose(out_inv_wh, dim0=2, dim1=3)
+                out_inv_wh[:,:,1::2,:] = torch.flip(out_inv_wh[:,:,1::2,:], dims=[3]) #flip row
+
+                y = [out_hw, out_wh, out_inv_hw, out_inv_wh]
+            else:
+                out_hw = out_y[:, 0].view(B, -1, H, W)
+                out_hw[:,:,:,0::2] = torch.flip(out_hw[:,:,:,0::2], dims=[2]) #flip column
+
+                out_wh = out_y[:, 1].view(B, -1, W, H)
+                out_wh = torch.transpose(out_wh, dim0=2, dim1=3)
+                out_wh[:,:,0::2,:] = torch.flip(out_wh[:,:,0::2,:], dims=[3]) #flip row
+
+                out_inv = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
+                out_inv_hw = out_inv[:, 0].view(B, -1, H, W)
+                out_inv_hw[:,:,:,0::2] = torch.flip(out_inv_hw[:,:,:,0::2], dims=[2]) #flip column
+
+                out_inv_wh = out_inv[:, 1].view(B, -1, W, H)
+                out_inv_wh = torch.transpose(out_inv_wh, dim0=2, dim1=3)
+                out_inv_wh[:,:,0::2,:] = torch.flip(out_inv_wh[:,:,0::2,:], dims=[3]) #flip row
+
+                y = [out_hw, out_wh, out_inv_hw, out_inv_wh]
+
+
+        y = torch.stack(y, dim=1)
+        if self.use_moe:
+            y = einops.rearrange(y, 'b k c h w -> b k c (h w)')
+            y = torch.einsum("b k c l, b l k -> b c l", y, weight_moe)
+        elif self.use_weighted:
+            #softmax of weights
+            s_weight = F.softmax(self.weight, dim=0)
+            y = einops.rearrange(y, 'b k c h w -> b k c (h w)')
+            s_weight = s_weight.unsqueeze(0).unsqueeze(0).repeat(y.shape[0], y.shape[-1],1)
+            y = torch.einsum("b k c l, b l k -> b c l", y, s_weight)
         else:
-            out_hw = out_y[:, 0].view(B, -1, H, W)
-            out_hw[:,:,:,0::2] = torch.flip(out_hw[:,:,:,0::2], dims=[2]) #flip column
+            y = torch.sum(y, dim=1)
+        return y
 
-            out_wh = out_y[:, 1].view(B, -1, W, H)
-            out_wh = torch.transpose(out_wh, dim0=2, dim1=3)
-            out_wh[:,:,0::2,:] = torch.flip(out_wh[:,:,0::2,:], dims=[3]) #flip row
-
-            out_inv = torch.flip(out_y[:, 2:4], dims=[-1]).view(B, 2, -1, L)
-            out_inv_hw = out_inv[:, 0].view(B, -1, H, W)
-            out_inv_hw[:,:,:,0::2] = torch.flip(out_inv_hw[:,:,:,0::2], dims=[2]) #flip column
-
-            out_inv_wh = out_inv[:, 1].view(B, -1, W, H)
-            out_inv_wh = torch.transpose(out_inv_wh, dim0=2, dim1=3)
-            out_inv_wh[:,:,0::2,:] = torch.flip(out_inv_wh[:,:,0::2,:], dims=[3]) #flip row
-
-        return out_hw, out_wh, out_inv_hw, out_inv_wh
 
     def forward(self, x: torch.Tensor, **kwargs):
         B, H, W, C = x.shape
@@ -355,16 +352,8 @@ class SS2D(nn.Module):
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.act(self.conv2d(x))
         
-        y1, y2, y3, y4 = self.forward_core(x)
-            
-        assert y1.dtype == torch.float32
-        if self.use_moe:
-            _, weight_moe = self.moe(einops.rearrange(x, 'b d h w -> b (h w) d'))
-            y = torch.stack([y1, y2, y3, y4], dim=1)
-            y = einops.rearrange(y, 'b k c h w -> b k c (h w)')
-            y = torch.einsum("b k c l, b l k -> b c l", y, weight_moe)
-        else:
-            y = y1 + y2 + y3 + y4
+        y = self.forward_core(x)
+        
         
         y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
         y = self.out_norm(y)
@@ -386,13 +375,15 @@ class VSSBlock(nn.Module):
             expand: float = 2.,
             is_light_sr: bool = False,
             use_moe=False,
+            use_weighted=False,
             number=0,
+            num_scans=4,
             **kwargs,
     ):
         super().__init__()
 
         self.ln_1 = norm_layer(hidden_dim)
-        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, use_moe=use_moe, number=number,**kwargs)
+        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, use_moe=use_moe, use_weighted=use_weighted, number=number, num_scans=num_scans, **kwargs)
         self.drop_path = DropPath(drop_path)
         self.skip_scale= nn.Parameter(torch.ones(hidden_dim))
         # self.conv_blk = CAB(hidden_dim,is_light_sr)
