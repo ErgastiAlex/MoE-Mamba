@@ -32,7 +32,7 @@ from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 from diffusion.rectified_flow import RectifiedFlow
-
+import random
 
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration, set_seed
@@ -149,7 +149,8 @@ def main(args):
         use_moe=args.use_moe,
         use_weighted=args.use_weighted,
         learn_pos_emb = args.learn_pos_emb,
-        num_scans=args.num_scans)
+        num_scans=args.num_scans,
+        has_text=args.has_text)
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
@@ -158,6 +159,11 @@ def main(args):
 
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}")
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    if args.has_text:
+        from encoders import FrozenCLIPEmbedder
+        text_emb = FrozenCLIPEmbedder()
+        text_emb.to(device)
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
@@ -169,26 +175,58 @@ def main(args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
-    train_dataset = ImageFolder(os.path.join(args.data_path,"train"), transform=transform)
-    test_dataset = ImageFolder(os.path.join(args.data_path,"val"), transform=transform)
 
-    loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
+    if args.has_text:
+        import torchvision
+        train_dataset = torchvision.datasets.CocoCaptions(root = os.path.join(args.data_path, "train"),
+                        annFile = os.path.join(args.data_path,"annotations","train.json"),
+                        transform=transform)
+        test_dataset = torchvision.datasets.CocoCaptions(root = os.path.join(args.data_path, "val"),
+                        annFile = os.path.join(args.data_path, "annotations", "val.json"),
+                        transform=transform)
+        def collate_fn(batch):
+            return tuple(zip(*batch))
+        loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate_fn
+        )
 
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
-    )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            collate_fn=collate_fn
+        )
+
+    else:
+        train_dataset = ImageFolder(os.path.join(args.data_path,"train"), transform=transform)
+        test_dataset = ImageFolder(os.path.join(args.data_path,"val"), transform=transform)
+
+        loader = DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
 
     logger.info(f"Train dataset contains {len(train_dataset)}")
     logger.info(f"Test dataset contains {len(test_dataset)}")
@@ -232,8 +270,16 @@ def main(args):
             break
 
         for x, y in loader:
-            if train_steps >= 500000:
+            if args.has_text:
+                captions=[]
+                for cap in y:
+                    captions.append(random.choice(cap))
+                y = text_emb(random.choice(captions))
+                x = torch.stack(x)
+                
+            if train_steps >= 300000:
                 break
+
 
             with torch.no_grad():
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
@@ -274,16 +320,23 @@ def main(args):
                 with torch.no_grad():
                     my_metrics.reset()
                     for x, y in test_loader:
+                        if args.has_text:
+                            captions=[]
+                            for cap in y:
+                                captions.append(random.choice(cap))
+                            y = text_emb(random.choice(captions))
+                            x = torch.stack(x)
+
+                
                         # Create sampling noise:
                         n = x.shape[0]
                         z = torch.randn(n, 4, latent_size, latent_size, device=device)*rectified_flow.noise_scale
 
-                        y_null = torch.tensor([args.num_classes]*n).to(device)
-
-                        y = torch.cat([y, y_null], dim=0)
-                        z = torch.cat([z,z], dim=0)
+                        # y = torch.cat([y, y_null], dim=0)
+                        # z = torch.cat([z,z], dim=0)
 
                         if args.num_classes != 0:
+                            assert False, "Not implemented"
                             model_kwargs = dict(y=y, cfg_scale=2.0)
                         else:
                             model_kwargs = dict(y=y)
@@ -292,7 +345,7 @@ def main(args):
                         samples = sample_fn(z, model_kwargs=model_kwargs, progress=False)
 
                         samples = vae.decode(samples / 0.18215).sample
-                        samples, _ = torch.chunk(samples, 2, dim=0)
+                        # samples, _ = torch.chunk(samples, 2, dim=0)
 
                         x = out2img(x)
                         samples = out2img(samples)
@@ -342,7 +395,7 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=2)
-    parser.add_argument("--num_scans", type=int, default=4, choices=[2, 4])
+    parser.add_argument("--num_scans", type=int, default=4, choices=[1, 2, 4])
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-seed", type=int, default=0)
@@ -357,6 +410,8 @@ if __name__ == "__main__":
     parser.add_argument('--use_weighted', action='store_true')
     parser.add_argument('--learn_pos_emb', action='store_true')
     parser.add_argument('--use_ckpt', action='store_true')
+
+    parser.add_argument('--has_text', action='store_true')
 
     parser.add_argument("--sampling", type=str, choices=["log", "uniform"], default="log")
     args = parser.parse_args()

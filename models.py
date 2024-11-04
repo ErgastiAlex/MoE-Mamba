@@ -18,6 +18,20 @@ from mamba_arch import VSSBlock
 import einops
 import torch.utils.checkpoint as checkpoint
 
+from inspect import isfunction
+if hasattr(torch.nn.functional, "scaled_dot_product_attention"):
+    ATTENTION_MODE = "flash"
+else:
+    try:
+        import xformers
+        import xformers.ops
+
+        ATTENTION_MODE = "xformers"
+    except:
+        ATTENTION_MODE = "math"
+print(f"attention mode is {ATTENTION_MODE}")
+
+
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
@@ -94,6 +108,61 @@ class LabelEmbedder(nn.Module):
             labels = self.token_drop(labels, force_drop_ids)
         embeddings = self.embedding_table(labels)
         return embeddings
+    
+def exists(val):
+    return val is not None
+
+
+def uniq(arr):
+    return {el: True for el in arr}.keys()
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
+
+class CrossAttention(nn.Module):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        context_dim = default(context_dim, query_dim)
+
+        self.scale = dim_head**-0.5
+        self.heads = heads
+
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(
+            nn.Linear(inner_dim, query_dim), nn.Dropout(dropout)
+        )
+
+    def forward(self, x, text, mask=None):
+        B, L, C = x.shape
+        q = self.to_q(x)
+        # text = default(text, x)
+        k = self.to_k(text)
+        v = self.to_v(text)
+
+        q, k, v = map(
+            lambda t: einops.rearrange(t, "B L (H D) -> B H L D", H=self.heads), (q, k, v)
+        )  # B H L D
+        if ATTENTION_MODE == "flash":
+            x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
+            x = einops.rearrange(x, "B H L D -> B L (H D)")
+        elif ATTENTION_MODE == "xformers":
+            x = xformers.ops.memory_efficient_attention(q, k, v)
+            x = einops.rearrange(x, "B L H D -> B L (H D)", H=self.heads)
+        elif ATTENTION_MODE == "math":
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = (attn @ v).transpose(1, 2).reshape(B, L, C)
+        else:
+            raise NotImplemented
+        return self.to_out(x)
+
 
 
 #################################################################################
@@ -113,10 +182,12 @@ class DiTBlock(nn.Module):
                        use_weighted=False,
                        number=0, 
                        num_scans=4,
+                       has_text=False, 
                        **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.use_mamba = use_mamba
+        self.has_text = has_text
         if use_mamba:
             self.attn = VSSBlock(
                 hidden_dim= hidden_size,
@@ -136,29 +207,47 @@ class DiTBlock(nn.Module):
             self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
         
         self.use_checkpoint = use_checkpoint
-        adaln_number = 3 if self.use_mamba else 6
+        # adaln_number = 3 if self.use_mamba else 6
+        adaln_number = (3*2 if self.has_text and self.use_mamba else (3*3 if self.has_text else (3 if self.use_mamba else 6)))
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, adaln_number * hidden_size, bias=True)
         )
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        if self.has_text:
+            self.mca = CrossAttention(
+                query_dim=hidden_size, context_dim=hidden_size, heads=8, dim_head=64, dropout=0.0
+            )
+            self.norm_mca = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
             
             
-    def forward(self, x, c):
+    def forward(self, x, c, text=None):
         if self.use_checkpoint:
-            return checkpoint.checkpoint(self._forward, x, c)
+            return checkpoint.checkpoint(self._forward, x, c, text)
         else:
-            return self._forward(x, c)
+            return self._forward(x, c, text)
     
-    def _forward(self, x, c):
-        if self.use_mamba:
-            shift_msa, scale_msa, gate_msa = self.adaLN_modulation(c).chunk(3, dim=1)
+    def _forward(self, x, c, text=None):
+        if not self.has_text:
+            if self.use_mamba:
+                shift_msa, scale_msa, gate_msa = self.adaLN_modulation(c).chunk(3, dim=1)
+            else:
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+            
+            if not self.use_mamba:
+                x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         else:
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        
-        if not self.use_mamba:
-            x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+            assert self.use_mamba, "CrossAttention is only supported with Mamba"
+            if self.use_mamba:
+                shift_msa, scale_msa, gate_msa, shift_mca, scale_mca, gate_mca= self.adaLN_modulation(c).chunk(6, dim=1)
+
+            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+            x = x + gate_mca.unsqueeze(1) * self.mca(modulate(self.norm_mca(x), shift_mca, scale_mca), text)
+            if not self.use_mamba:
+                x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+
         return x
     
 
@@ -205,6 +294,8 @@ class DiT(nn.Module):
         use_weighted = False,
         learn_pos_emb = False,
         num_scans = 4,
+        has_text = False,
+        d_context = 768,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -215,14 +306,15 @@ class DiT(nn.Module):
         self.use_mamba = use_mamba
         self.learn_pos_emb = learn_pos_emb
         self.num_classes = num_classes
-
+        self.has_text = has_text
         #bias = true
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         
-        if self.num_classes != 0:
+        if self.num_classes > 0:
             self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
-        
+        else:
+            self.y_embedder = nn.Linear(d_context, hidden_size)
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=self.learn_pos_emb)
@@ -236,7 +328,8 @@ class DiT(nn.Module):
                     use_weighted = use_weighted,
                     use_checkpoint=use_checkpoint,
                     number=i,
-                    num_scans=num_scans) for i in range(depth)
+                    num_scans=num_scans,
+                    has_text=has_text) for i in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
@@ -303,12 +396,16 @@ class DiT(nn.Module):
         """
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
         t = self.t_embedder(t)                   # (N, D)
-        if self.num_classes != 0:
+        if self.has_text:
+            y = self.y_embedder(y)
+            c = t + y.mean(1)
+        elif self.num_classes > 0:
             y = self.y_embedder(y, self.training)    # (N, D)
             c = t + y                                # (N, D)
-        c = t
+        else:
+            c = t
         for block in self.blocks:
-            x = block(x, c)
+            x = block(x, c, y)
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
