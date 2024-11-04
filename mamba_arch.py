@@ -17,24 +17,48 @@ NEG_INF = -1000000
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1).unsqueeze(1)) + shift.unsqueeze(1).unsqueeze(1)
 
-class MoE(nn.Module):
-    def __init__(self, hidden_dim, num_moe):
-        super(MoE, self).__init__()
+class MoS(nn.Module):
+    def __init__(self, hidden_dim, num_mos, act="soft"):
+        super(MoS, self).__init__()
         self.net = nn.Sequential(
-            nn.Linear(hidden_dim, num_moe),
+            nn.Linear(hidden_dim, num_mos),
         )
-
-        self.soft = nn.Softmax(dim=-1)
-
+        self.noise_linear =nn.Linear(hidden_dim, num_mos)
+        self.act=act
+        if act == "soft":
+            self.out = nn.Softmax(dim=-1)
+        else:
+            self.out = nn.Sigmoid()
         #TODO: Inizializzare linear con 0 per fare si che all'inizio il peso sia 1/4 per ogni testa
-        
+        nn.init.constant_(self.net[0].weight, 0)
+     
     
     def forward(self, x):
         logits = self.net(x)
+        if self.act=="soft":
+            noise_logits = self.noise_linear(x)
+            noise = torch.randn_like(logits)*F.softplus(noise_logits)
+            noisy_logits = logits + noise
+            return self.out(noisy_logits)
+        else:
+            return self.out(logits)
+#         # return logits, self.soft(logits)
+# class MoE(nn.Module):
+#     def __init__(self, hidden_dim, num_moe):
+#         super(MoE, self).__init__()
+#         self.net = nn.Sequential(
+#             nn.Linear(hidden_dim, num_moe),
+#         )
+
+#         self.soft = nn.Softmax(dim=-1)
+
+#         # TODO: Inizializzare linear con 0 per fare si che all'inizio il peso sia 1/4 per ogni testa
+#         # init linear to zero
+
+#     def forward(self, x):
+#         logits = self.net(x)
         
-        return logits, self.soft(logits)
-
-
+#         return self.soft(logits)
 class SS2D(nn.Module):
     def __init__(
             self,
@@ -62,7 +86,7 @@ class SS2D(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         
-        assert not (use_moe and use_weighted), "Cannot use both MoE and weighted sum"
+        assert not (use_moe and use_weighted), "Cannot use both MoS and weighted sum"
 
         self.use_moe = use_moe
         self.use_weighted = use_weighted
@@ -112,7 +136,7 @@ class SS2D(nn.Module):
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
 
         if self.use_moe:
-            self.moe = MoE(self.d_inner, self.num_scans)
+            self.mos = MoS(self.d_inner, self.num_scans)
         
         if self.use_weighted:
             self.weight = nn.Parameter(torch.zeros(self.num_scans))
@@ -177,63 +201,105 @@ class SS2D(nn.Module):
     def get_horizontal_scan1(self, x):
         x[:,:,:,1::2] = torch.flip(x[:,:,:,1::2], dims=[2]) #flip column
         return x
+    
+    def revert_horizontal_scan1(self, x):
+        return self.get_horizontal_scan1(x)
 
     def get_horizontal_scan2(self, x):
         x[:,:,:,0::2] = torch.flip(x[:,:,:,0::2], dims=[2]) #flip column
         return x
+    
+    def revert_horizontal_scan2(self, x):
+        return self.get_horizontal_scan2(x)
 
     def get_vertical_scan1(self, x):
         x[:,:,1::2,:] = torch.flip(x[:,:,1::2,:], dims=[3]) #flip row
         x = torch.transpose(x, dim0=2, dim1=3)
         return x
-    
+
+    def revert_vertical_scan1(self, x):
+        x = torch.transpose(x, dim0=2, dim1=3) #change H and W
+        x[:,:,1::2,:] = torch.flip(x[:,:,1::2,:], dims=[3]) #flip row
+        return x
+
     def get_vertical_scan2(self, x):
         x[:,:,0::2,:] = torch.flip(x[:,:,0::2,:], dims=[3])
         x = torch.transpose(x, dim0=2, dim1=3)
         return x
+    
+    def revert_vertical_scan2(self, x):
+        x = torch.transpose(x, dim0=2, dim1=3)
+        x[:,:,0::2,:] = torch.flip(x[:,:,0::2,:], dims=[3])
+        return x
+    
     def forward_core(self, x: torch.Tensor):
         B, C, H, W = x.shape
         L = H * W
         K = self.num_scans
 
         if self.use_moe:
-            _, weight_moe = self.moe(einops.rearrange(x, 'b d h w -> b (h w) d'))
-
-        if self.num_scans == 2:
+            weight_mos = self.mos(einops.rearrange(x, 'b d h w -> b (h w) d'))
+        
+        if self.num_scans == 1:
+            if self.number % 8 == 0:
+                x_hw = self.get_horizontal_scan1(x).reshape(B, 1, -1, L) # (1, 1, 192, 3136)
+                xs = x_hw
+            elif self.number % 8 == 1:
+                x_hw = self.get_horizontal_scan1(x).reshape(B, 1, -1, L)
+                xs = torch.flip(x_hw, dims=[-1])
+            elif self.number % 8 == 2:
+                x_hw = self.get_horizontal_scan2(x).reshape(B, 1, -1, L)
+                xs = x_hw
+            elif self.number % 8 == 3:
+                x_hw = self.get_horizontal_scan2(x).reshape(B, 1, -1, L)
+                xs = torch.flip(x_hw, dims=[-1])
+            elif self.number % 8 == 4:
+                x_wh = self.get_vertical_scan1(x).reshape(B, 1, -1, L)
+                xs = x_wh
+            elif self.number % 8 == 5:
+                x_wh = self.get_vertical_scan1(x).reshape(B, 1, -1, L)
+                xs = torch.flip(x_wh, dims=[-1])
+            elif self.number % 8 == 6:
+                x_wh = self.get_vertical_scan2(x).reshape(B, 1, -1, L)
+                xs = x_wh
+            elif self.number % 8 == 7:
+                x_wh = self.get_vertical_scan2(x).reshape(B, 1, -1, L)
+                xs = torch.flip(x_wh, dims=[-1])
+        elif self.num_scans == 2:
             if self.number % 4 == 0:
-                x_hw = self.get_horizontal_scan1(x)
+                x_hw = self.get_horizontal_scan1(x).reshape(B, 1, -1, L)
                 xs = torch.cat([x_hw, torch.flip(x_hw, dims=[-1])], dim=1) # (1, 2, 192, 3136)
             elif self.number % 4 == 1:
-                x_hw = self.get_horizontal_scan2(x)
+                x_hw = self.get_horizontal_scan2(x).reshape(B, 1, -1, L)
                 xs = torch.cat([x_hw, torch.flip(x_hw, dims=[-1])], dim=1) # (1, 2, 192, 3136)
             elif self.number % 4 == 2:
-                x_wh = self.get_vertical_scan1(x)
+                x_wh = self.get_vertical_scan1(x).reshape(B, 1, -1, L)
                 xs = torch.cat([x_wh, torch.flip(x_wh, dims=[-1])], dim=1)
             elif self.number % 4 == 3:
-                x_wh = self.get_vertical_scan2(x)
+                x_wh = self.get_vertical_scan2(x).reshape(B, 1, -1, L)
                 xs = torch.cat([x_wh, torch.flip(x_wh, dims=[-1])], dim=1)
 
         elif self.num_scans == 4:
             if self.number%2==0:
-                x_hw = self.get_horizontal_scan1(x)
-                x_wh = self.get_vertical_scan1(x)
-                x_hwwh = torch.stack([x_hw,x_wh], dim=1).view(B, 2, -1, L)
+                x_hw = self.get_horizontal_scan1(x).reshape(B, 1, -1, L)
+                x_wh = self.get_vertical_scan1(x).reshape(B, 1, -1, L)
+                x_hwwh = torch.cat([x_hw,x_wh], dim=1) # (B, 2, C, L)
                 xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
             else:
-                x_hw = self.get_horizontal_scan2(x)
-                x_wh = self.get_vertical_scan2(x)
-                x_hwwh = torch.stack([x_hw,x_wh], dim=1).view(B, 2, -1, L)
+                x_hw = self.get_horizontal_scan2(x).reshape(B, 1, -1, L)
+                x_wh = self.get_vertical_scan2(x).reshape(B, 1, -1, L)
+                x_hwwh = torch.cat([x_hw,x_wh], dim=1)
                 xs = torch.cat([x_hwwh, torch.flip(x_hwwh, dims=[-1])], dim=1) # (1, 4, 192, 3136)
         elif self.num_scans == 8:
             raise NotImplementedError
         
 
-        x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.view(B, K, -1, L), self.x_proj_weight)
+        x_dbl = torch.einsum("b k d l, k c d -> b k c l", xs.contiguous().view(B, K, -1, L), self.x_proj_weight)
         
         dts, Bs, Cs = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=2)
         
         dts = torch.einsum("b k r l, k d r -> b k d l", dts.view(B, K, -1, L), self.dt_projs_weight)
-        xs = xs.float().view(B, -1, L)
+        xs = xs.float().contiguous().view(B, -1, L)
         dts = dts.contiguous().float().view(B, -1, L) # (b, k * d, l)
         Bs = Bs.float().view(B, K, -1, L)
         Cs = Cs.float().view(B, K, -1, L) # (b, k, d_state, l)
@@ -249,48 +315,87 @@ class SS2D(nn.Module):
             delta_softplus=True,
             return_last_state=False,
         ).view(B, K, -1, L)
+        
+        if self.num_scans == 1:
+            if self.number % 8 == 0:
+                out = out_y[:, 0].view(B, -1, H, W)
+                out = self.revert_horizontal_scan1(out)
 
-        if self.num_scans == 2:
+            elif self.number % 8 == 1:
+                out = out_y[:, 0].reshape(B, -1, L)
+                out = torch.flip(out, dims=[-1]).view(B, -1, H, W)
+                out = self.revert_horizontal_scan1(out)
+
+            elif self.number % 8 == 2:
+                out = out_y[:, 0].view(B, -1, H, W)
+                out = self.revert_horizontal_scan2(out)
+                
+            elif self.number % 8 == 3:
+                out = out_y[:, 0].reshape(B, -1, L)
+                out = torch.flip(out, dims=[-1]).view(B, -1, H, W)
+                out = self.revert_horizontal_scan2(out)
+
+            elif self.number % 8 == 4:
+                out = out_y[:, 0].view(B, -1, W, H)
+                out = self.revert_vertical_scan1(out)
+
+            elif self.number % 8 == 5:
+                out = out_y[:, 0].reshape(B, -1, L)
+                out = torch.flip(out, dims=[-1]).view(B, -1, W, H)
+                out = self.revert_vertical_scan1(out)
+
+            elif self.number % 8 == 6:
+                out = out_y[:, 0].view(B, -1, W, H)
+                out = self.revert_vertical_scan2(out)
+
+            elif self.number % 8 == 7:
+                out = out_y[:, 0].reshape(B, -1, L)
+                out = torch.flip(out, dims=[-1]).view(B, -1, W, H)
+                out = self.revert_vertical_scan2(out).view(B, -1, H, W)
+
+            y = einops.rearrange(out, 'b c h w -> b c (h w)')
+
+        elif self.num_scans == 2:
             if self.number % 4 == 0:
                 out_hw = out_y[:, 0].view(B, -1, H, W)
-                out_hw[:,:,:,1::2] = torch.flip(out_hw[:,:,:,1::2], dims=[2]) #flip column
+                out_hw = self.revert_horizontal_scan1(out_hw)
 
-                out_inv_hw = torch.flip(out_y[:, 1], dims=[-1]).view(B, -1, H, W)
-                out_inv_hw[:,:,:,1::2] = torch.flip(out_inv_hw[:,:,:,1::2], dims=[2]) #flip column
-
+                out_inv_hw = out_y[:,1].reshape(B, -1, L)
+                out_inv_hw = torch.flip(out_inv_hw, dims=[-1]).view(B, -1, H, W)
+                out_inv_hw = self.revert_horizontal_scan1(out_inv_hw)
                 y = [out_hw, out_inv_hw]
 
             elif self.number % 4 == 1:
                 out_hw = out_y[:, 0].view(B, -1, H, W)
-                out_hw[:,:,:,0::2] = torch.flip(out_hw[:,:,:,0::2], dims=[2])
+                out_hw = self.revert_horizontal_scan2(out_hw)
 
-                out_inv_hw = torch.flip(out_y[:, 1], dims=[-1]).view(B, -1, H, W)
-                out_inv_hw[:,:,:,0::2] = torch.flip(out_inv_hw[:,:,:,0::2], dims=[2])
+                out_inv_hw = out_y[:, 1].reshape(B, -1, L)
+                out_inv_hw = torch.flip(out_inv_hw, dims=[-1]).view(B, -1, H, W)
+                out_inv_hw = self.revert_horizontal_scan2(out_inv_hw)
 
                 y = [out_hw, out_inv_hw]
             
             elif self.number % 4 == 2:
                 out_wh = out_y[:, 0].view(B, -1, W, H)
-                out_wh = torch.transpose(out_wh, dim0=2, dim1=3)
-                out_wh[:,:,1::2,:] = torch.flip(out_wh[:,:,1::2,:], dims=[3])
+                out_wh = self.revert_vertical_scan1(out_wh)
 
-                out_inv_wh = torch.flip(out_y[:, 1], dims=[-1]).view(B, -1, W, H)
-                out_inv_wh = torch.transpose(out_inv_wh, dim0=2, dim1=3)
-                out_inv_wh[:,:,1::2,:] = torch.flip(out_inv_wh[:,:,1::2,:], dims=[3])
+                out_inv_wh = out_y[:, 1].reshape(B, -1, L)
+                out_inv_wh = torch.flip(out_inv_wh, dims=[-1]).view(B, -1, W, H)
+                out_inv_wh = self.revert_vertical_scan1(out_inv_wh)
 
                 y = [out_wh, out_inv_wh]
             
             elif self.number % 4 == 3:
                 out_wh = out_y[:, 0].view(B, -1, W, H)
-                out_wh = torch.transpose(out_wh, dim0=2, dim1=3)
-                out_wh[:,:,0::2,:] = torch.flip(out_wh[:,:,0::2,:], dims=[3])
+                out_wh = self.get_vertical_scan2(out_wh)
 
-                out_inv_wh = torch.flip(out_y[:, 1], dims=[-1]).view(B, -1, W, H)
-                out_inv_wh = torch.transpose(out_inv_wh, dim0=2, dim1=3)
-                out_inv_wh[:,:,0::2,:] = torch.flip(out_inv_wh[:,:,0::2,:], dims=[3])
+                out_inv_wh = out_y[:, 1].reshape(B, -1, L)
+                out_inv_wh = torch.flip(out_inv_wh, dims=[-1]).view(B, -1, W, H)
+                out_inv_wh = self.get_vertical_scan2(out_inv_wh)
 
                 y = [out_wh, out_inv_wh]
         elif self.num_scans == 4:
+            raise NotImplementedError()
             if self.number%2==0:
                 out_hw = out_y[:, 0].view(B, -1, H, W)
                 out_hw[:,:,:,1::2] = torch.flip(out_hw[:,:,:,1::2], dims=[2]) #flip column
@@ -325,20 +430,21 @@ class SS2D(nn.Module):
                 out_inv_wh[:,:,0::2,:] = torch.flip(out_inv_wh[:,:,0::2,:], dims=[3]) #flip row
 
                 y = [out_hw, out_wh, out_inv_hw, out_inv_wh]
-
-
-        y = torch.stack(y, dim=1)
-        if self.use_moe:
-            y = einops.rearrange(y, 'b k c h w -> b k c (h w)')
-            y = torch.einsum("b k c l, b l k -> b c l", y, weight_moe)
-        elif self.use_weighted:
-            #softmax of weights
-            s_weight = F.softmax(self.weight, dim=0)
-            y = einops.rearrange(y, 'b k c h w -> b k c (h w)')
-            s_weight = s_weight.unsqueeze(0).unsqueeze(0).repeat(y.shape[0], y.shape[-1],1)
-            y = torch.einsum("b k c l, b l k -> b c l", y, s_weight)
-        else:
-            y = torch.sum(y, dim=1)
+        
+        if self.num_scans > 1:
+            y = torch.stack(y, dim=1)
+            if self.use_moe:
+                y = einops.rearrange(y, 'b k c h w -> b k c (h w)')
+                y = torch.einsum("b k c l, b l k -> b c l", y, weight_mos)
+            elif self.use_weighted:
+                #softmax of weights
+                s_weight = F.softmax(self.weight, dim=0)
+                y = einops.rearrange(y, 'b k c h w -> b k c (h w)')
+                s_weight = s_weight.unsqueeze(0).unsqueeze(0).repeat(y.shape[0], y.shape[-1],1)
+                y = torch.einsum("b k c l, b l k -> b c l", y, s_weight)
+            else:
+                y = torch.sum(y, dim=1)
+                #y = y1 + y2 + y3 + y4 
         return y
 
 
@@ -352,8 +458,7 @@ class SS2D(nn.Module):
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.act(self.conv2d(x))
         
-        y = self.forward_core(x)
-        
+        y = self.forward_core(x) # B C L
         
         y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
         y = self.out_norm(y)
