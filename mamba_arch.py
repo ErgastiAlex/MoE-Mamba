@@ -387,11 +387,11 @@ class SS2D(nn.Module):
             
             elif self.number % 4 == 3:
                 out_wh = out_y[:, 0].view(B, -1, W, H)
-                out_wh = self.get_vertical_scan2(out_wh)
+                out_wh = self.revert_vertical_scan2(out_wh)
 
                 out_inv_wh = out_y[:, 1].reshape(B, -1, L)
                 out_inv_wh = torch.flip(out_inv_wh, dims=[-1]).view(B, -1, W, H)
-                out_inv_wh = self.get_vertical_scan2(out_inv_wh)
+                out_inv_wh = self.revert_vertical_scan2(out_inv_wh)
 
                 y = [out_wh, out_inv_wh]
         elif self.num_scans == 4:
@@ -436,6 +436,25 @@ class SS2D(nn.Module):
             if self.use_moe:
                 y = einops.rearrange(y, 'b k c h w -> b k c (h w)')
                 y = torch.einsum("b k c l, b l k -> b c l", y, weight_mos)
+
+
+                # import matplotlib.pyplot as plt
+
+                # fig, axs = plt.subplots(1, 2)
+                # for i in range(2):
+                #     #make all images the same size
+                #     axs[i].set_aspect('equal')
+                #     heatmap=axs[i].imshow(weight_mos[0,:,i].reshape(H,W).detach().cpu().numpy(), cmap='YlGn', vmin=0, vmax=1)
+                #     #disable ticks
+                #     axs[i].set_xticks([])
+                #     axs[i].set_yticks([])
+                #     #show colorbar
+                #     if i==1:
+                #         cax = fig.add_axes([axs[i].get_position().x1+0.01,axs[i].get_position().y0,0.02,axs[i].get_position().height])
+                #         plt.colorbar(heatmap, cax=cax) # Similar to fig.colorbar(im, cax = cax)
+
+                # #save with random name
+                # plt.savefig(f'./mm/weight_moe_{self.number}.png', bbox_inches='tight', pad_inches=0.1)
             elif self.use_weighted:
                 #softmax of weights
                 s_weight = F.softmax(self.weight, dim=0)
