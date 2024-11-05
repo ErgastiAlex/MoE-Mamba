@@ -30,7 +30,7 @@ class MoS(nn.Module):
         else:
             self.out = nn.Sigmoid()
         #TODO: Inizializzare linear con 0 per fare si che all'inizio il peso sia 1/4 per ogni testa
-        nn.init.constant_(self.net[0].weight, 0)
+        # nn.init.constant_(self.net[0].weight, 0)
      
     
     def forward(self, x):
@@ -199,37 +199,37 @@ class SS2D(nn.Module):
         return D
 
     def get_horizontal_scan1(self, x):
-        x[:,:,:,1::2] = torch.flip(x[:,:,:,1::2], dims=[2]) #flip column
+        x[:,:,1::2] = torch.flip(x[:,:,1::2], dims=[3]) #flip column
         return x
     
     def revert_horizontal_scan1(self, x):
         return self.get_horizontal_scan1(x)
 
     def get_horizontal_scan2(self, x):
-        x[:,:,:,0::2] = torch.flip(x[:,:,:,0::2], dims=[2]) #flip column
+        x[:,:,0::2] = torch.flip(x[:,:,0::2], dims=[3]) #flip column
         return x
     
     def revert_horizontal_scan2(self, x):
         return self.get_horizontal_scan2(x)
 
     def get_vertical_scan1(self, x):
-        x[:,:,1::2,:] = torch.flip(x[:,:,1::2,:], dims=[3]) #flip row
+        x[:,:,:,1::2] = torch.flip(x[:,:,:,1::2], dims=[2]) #flip row
         x = torch.transpose(x, dim0=2, dim1=3)
         return x
 
     def revert_vertical_scan1(self, x):
         x = torch.transpose(x, dim0=2, dim1=3) #change H and W
-        x[:,:,1::2,:] = torch.flip(x[:,:,1::2,:], dims=[3]) #flip row
+        x[:,:,:,1::2] = torch.flip(x[:,:,:,1::2], dims=[2]) #flip row
         return x
 
     def get_vertical_scan2(self, x):
-        x[:,:,0::2,:] = torch.flip(x[:,:,0::2,:], dims=[3])
+        x[:,:,:,0::2] = torch.flip(x[:,:,:,0::2], dims=[2])
         x = torch.transpose(x, dim0=2, dim1=3)
         return x
     
     def revert_vertical_scan2(self, x):
         x = torch.transpose(x, dim0=2, dim1=3)
-        x[:,:,0::2,:] = torch.flip(x[:,:,0::2,:], dims=[3])
+        x[:,:,:,0::2] = torch.flip(x[:,:,:,0::2], dims=[2])
         return x
     
     def forward_core(self, x: torch.Tensor):
