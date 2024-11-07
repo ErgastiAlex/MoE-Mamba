@@ -183,6 +183,7 @@ class DiTBlock(nn.Module):
                        number=0, 
                        num_scans=4,
                        has_text=False, 
+                       skip_gate=False,
                        **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -199,7 +200,8 @@ class DiTBlock(nn.Module):
                 use_moe=use_moe,
                 use_weighted=use_weighted,
                 number=number,
-                num_scans=num_scans)
+                num_scans=num_scans,
+                skip_gate=skip_gate,)
         else:
             self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
             mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -296,6 +298,7 @@ class DiT(nn.Module):
         num_scans = 4,
         has_text = False,
         d_context = 768,
+        skip_gate = False,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -329,7 +332,8 @@ class DiT(nn.Module):
                     use_checkpoint=use_checkpoint,
                     number=i,
                     num_scans=num_scans,
-                    has_text=has_text) for i in range(depth)
+                    has_text=has_text,
+                    skip_gate=skip_gate) for i in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()

@@ -35,7 +35,7 @@ class MoS(nn.Module):
     
     def forward(self, x):
         logits = self.net(x)
-        if self.act=="soft":
+        if self.act=="soft" and self.training:
             noise_logits = self.noise_linear(x)
             noise = torch.randn_like(logits)*F.softplus(noise_logits)
             noisy_logits = logits + noise
@@ -81,6 +81,7 @@ class SS2D(nn.Module):
             use_weighted=False,
             number=0,
             num_scans=4,
+            skip_gate=False,
             **kwargs,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
@@ -98,8 +99,11 @@ class SS2D(nn.Module):
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.number=number
         self.num_scans=num_scans
-
-        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+        self.skip_gate = skip_gate
+        if self.skip_gate:
+            self.in_proj = nn.Linear(self.d_model, self.d_inner, bias=bias, **factory_kwargs)
+        else:
+            self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
         self.conv2d = nn.Conv2d(
             in_channels=self.d_inner,
             out_channels=self.d_inner,
@@ -472,7 +476,10 @@ class SS2D(nn.Module):
 
         xz = self.in_proj(x)
         
-        x, z = xz.chunk(2, dim=-1)
+        if self.skip_gate:
+            x = xz
+        else:
+            x, z = xz.chunk(2, dim=-1)
             
         x = x.permute(0, 3, 1, 2).contiguous()
         x = self.act(self.conv2d(x))
@@ -481,7 +488,10 @@ class SS2D(nn.Module):
         
         y = torch.transpose(y, dim0=1, dim1=2).contiguous().view(B, H, W, -1)
         y = self.out_norm(y)
-        y = y * F.silu(z)
+        
+        if not self.skip_gate:
+            y = y * F.silu(z)
+        
         out = self.out_proj(y)
         if self.dropout is not None:
             out = self.dropout(out)
@@ -502,12 +512,13 @@ class VSSBlock(nn.Module):
             use_weighted=False,
             number=0,
             num_scans=4,
+            skip_gate=False,
             **kwargs,
     ):
         super().__init__()
 
         self.ln_1 = norm_layer(hidden_dim)
-        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, use_moe=use_moe, use_weighted=use_weighted, number=number, num_scans=num_scans, **kwargs)
+        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, use_moe=use_moe, use_weighted=use_weighted, number=number, num_scans=num_scans, skip_gate=skip_gate, **kwargs)
         self.drop_path = DropPath(drop_path)
         self.skip_scale= nn.Parameter(torch.ones(hidden_dim))
         # self.conv_blk = CAB(hidden_dim,is_light_sr)
