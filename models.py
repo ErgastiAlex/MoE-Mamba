@@ -32,6 +32,9 @@ else:
 print(f"attention mode is {ATTENTION_MODE}")
 
 
+def modulate2d(x, shift, scale):
+    return x * (1 + scale.unsqueeze(1).unsqueeze(1)) + shift.unsqueeze(1).unsqueeze(1)
+
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
@@ -174,43 +177,30 @@ class DiTBlock(nn.Module):
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
     def __init__(self, hidden_size, 
-                       num_heads, 
-                       mlp_ratio=4.0, 
                        use_checkpoint=True, 
-                       use_mamba=True, 
-                       use_moe=False, 
-                       use_weighted=False,
                        number=0, 
                        num_scans=4,
                        has_text=False, 
                        skip_gate=False,
+                       skip_conn=False,
                        **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.use_mamba = use_mamba
         self.has_text = has_text
-        if use_mamba:
-            self.attn = VSSBlock(
+        self.attn = VSSBlock(
                 hidden_dim= hidden_size,
                 drop_path=0,
                 norm_layer=nn.LayerNorm,
                 attn_drop_rate=0,
                 d_state=16,
                 input_resolution=256,
-                use_moe=use_moe,
-                use_weighted=use_weighted,
                 number=number,
                 num_scans=num_scans,
-                skip_gate=skip_gate,)
-        else:
-            self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-            mlp_hidden_dim = int(hidden_size * mlp_ratio)
-            approx_gelu = lambda: nn.GELU(approximate="tanh")
-            self.mlp = Mlp(in_features=hidden_size, hidden_features=mlp_hidden_dim, act_layer=approx_gelu, drop=0)
+                skip_gate=skip_gate)
         
         self.use_checkpoint = use_checkpoint
-        # adaln_number = 3 if self.use_mamba else 6
-        adaln_number = (3*2 if self.has_text and self.use_mamba else (3*3 if self.has_text else (3 if self.use_mamba else 6)))
+        adaln_number = (3*2 if self.has_text else 3)
+
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_size, adaln_number * hidden_size, bias=True)
@@ -222,33 +212,34 @@ class DiTBlock(nn.Module):
                 query_dim=hidden_size, context_dim=hidden_size, heads=8, dim_head=64, dropout=0.0
             )
             self.norm_mca = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
+
+        self.skip_conn=skip_conn
+        if skip_conn:
+            self.skip = nn.Linear(2*hidden_size, hidden_size, bias=True)
             
             
-    def forward(self, x, c, text=None):
+    def forward(self, x, c, skip=None, text=None):
         if self.use_checkpoint:
-            return checkpoint.checkpoint(self._forward, x, c, text)
+            return checkpoint.checkpoint(self._forward, x, c, skip, text)
         else:
             return self._forward(x, c, text)
     
-    def _forward(self, x, c, text=None):
-        if not self.has_text:
-            if self.use_mamba:
-                shift_msa, scale_msa, gate_msa = self.adaLN_modulation(c).chunk(3, dim=1)
-            else:
-                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-            
-            if not self.use_mamba:
-                x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        else:
-            assert self.use_mamba, "CrossAttention is only supported with Mamba"
-            if self.use_mamba:
-                shift_msa, scale_msa, gate_msa, shift_mca, scale_mca, gate_mca= self.adaLN_modulation(c).chunk(6, dim=1)
+    def _forward(self, x, c, skip=None, text=None):
+        """
+            x: [B, H, W, C]
+        """
+        if skip is not None and self.skip_conn:
+            x = torch.cat([x, skip], dim=-1)
+            x = self.skip(x)
 
-            x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-            x = x + gate_mca.unsqueeze(1) * self.mca(modulate(self.norm_mca(x), shift_mca, scale_mca), text)
-            if not self.use_mamba:
-                x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
+        if not self.has_text:
+            shift_msa, scale_msa, gate_msa = self.adaLN_modulation(c).chunk(3, dim=1)
+            x = x + gate_msa.unsqueeze(1).unsqueeze(1) * self.attn(modulate2d(self.norm1(x), shift_msa, scale_msa))
+        else:
+            shift_msa, scale_msa, gate_msa, shift_mca, scale_mca, gate_mca= self.adaLN_modulation(c).chunk(6, dim=1)
+
+            x = x + gate_msa.unsqueeze(1).unsqueeze(1) * self.attn(modulate2d(self.norm1(x), shift_msa, scale_msa))
+            x = x + gate_mca.unsqueeze(1).unsqueeze(1) * self.mca(modulate2d(self.norm_mca(x), shift_mca, scale_mca), text)
 
         return x
     
@@ -291,14 +282,12 @@ class DiT(nn.Module):
         num_classes=1000,
         learn_sigma=True,
         use_checkpoint=True,
-        use_mamba = False,
-        use_moe = False,
-        use_weighted = False,
         learn_pos_emb = False,
         num_scans = 4,
         has_text = False,
         d_context = 768,
         skip_gate = False,
+        skip_conn = False
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -306,7 +295,6 @@ class DiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
-        self.use_mamba = use_mamba
         self.learn_pos_emb = learn_pos_emb
         self.num_classes = num_classes
         self.has_text = has_text
@@ -318,23 +306,48 @@ class DiT(nn.Module):
             self.y_embedder = LabelEmbedder(num_classes, hidden_size, class_dropout_prob)
         else:
             self.y_embedder = nn.Linear(d_context, hidden_size)
+
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=self.learn_pos_emb)
 
-        self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, 
-                    num_heads, 
-                    mlp_ratio=mlp_ratio, 
-                    use_mamba = use_mamba, 
-                    use_moe = use_moe, 
-                    use_weighted = use_weighted,
-                    use_checkpoint=use_checkpoint,
-                    number=i,
+        self.enc_blocks = []
+        enc_div = (depth//2)//3
+        for i in range(depth//2):
+            self.enc_blocks.append(DiTBlock(hidden_size, 
+                    number=i, 
                     num_scans=num_scans,
                     has_text=has_text,
-                    skip_gate=skip_gate) for i in range(depth)
-        ])
+                    skip_gate=skip_gate,
+                    decoder=False))
+            if (i+1) % enc_div == 0:
+                self.enc_blocks.append(
+                    nn.Conv2d(hidden_size, hidden_size, kernel_size=2, stride=2, padding=0)
+                )
+        
+        self.enc_blocks = nn.ModuleList(self.enc_blocks)
+
+        self.middle_block = DiTBlock(hidden_size,
+                    number=depth//2, 
+                    num_scans=num_scans,
+                    has_text=has_text,
+                    skip_conn=False)
+    
+        self.dec_blocks = []
+        dec_div = (depth//2)//3
+        for i in range(depth//2):
+            if (i) % dec_div == 0:
+                self.dec_blocks.append(
+                    nn.ConvTranspose2d(hidden_size, hidden_size, kernel_size=2, stride=2, padding=0)
+                )
+            self.dec_blocks.append(DiTBlock(hidden_size, 
+                    number=i+depth//2+1, 
+                    num_scans=num_scans,
+                    has_text=has_text,
+                    skip_gate=skip_gate,
+                    skip_conn=skip_conn))
+
+        self.dec_blocks = nn.ModuleList(self.dec_blocks)
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
@@ -366,9 +379,17 @@ class DiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        for block in self.enc_blocks:
+            if hasattr(block, "adaLN_modulation"):
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        for block in self.dec_blocks:
+            if hasattr(block, "adaLN_modulation"):
+                nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+                nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+        
+        nn.init.constant_(self.middle_block.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.middle_block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
@@ -408,9 +429,34 @@ class DiT(nn.Module):
             c = t + y                                # (N, D)
         else:
             c = t
-        for block in self.blocks:
-            x = block(x, c, y)
+
+        B, L, D = x.shape
+
+        x = x.view(B, int(np.sqrt(L)), int(np.sqrt(L)), D).contiguous()  # [B,H,W,C]
+
+        xs=[]
+        for block in self.enc_blocks:
+            if not isinstance(block, nn.Conv2d):
+                x = block(x, c, skip=None, text=y)
+                xs.append(x)
+            else:
+                x = x.permute(0, 3, 1, 2).contiguous()
+                x = block(x)
+                x = x.permute(0, 2, 3, 1).contiguous()
+
+        x = self.middle_block(x, c, skip=None, text=y)
+
+        for block in self.dec_blocks:
+            if not isinstance(block, nn.ConvTranspose2d):
+                x = block(x, c, skip=xs.pop(), text=y)
+            else:
+                x = x.permute(0, 3, 1, 2).contiguous() # [B,C,H,W]
+                x = block(x)
+                x = x.permute(0, 2, 3, 1).contiguous() # [B,H,W,C]
+
+        x = x.view(B, L, D).contiguous()  # [B,H,W,C]
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
+
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
 
@@ -493,16 +539,16 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 #################################################################################
 
 def DiT_XL_1(**kwargs):
-    return DiT(depth=56, hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
+    return DiT(depth=57, hidden_size=1152, patch_size=1, num_heads=16, **kwargs)
 
 def DiT_L_1(**kwargs):
-    return DiT(depth=48, hidden_size=1024, patch_size=1, num_heads=16, **kwargs)
+    return DiT(depth=49, hidden_size=1024, patch_size=1, num_heads=16, **kwargs)
 
 def DiT_B_1(**kwargs):
-    return DiT(depth=24, hidden_size=768, patch_size=1, num_heads=16, **kwargs)
+    return DiT(depth=25, hidden_size=768, patch_size=1, num_heads=16, **kwargs)
 
 def DiT_S_1(**kwargs):
-    return DiT(depth=12, hidden_size=384, patch_size=1, num_heads=16, **kwargs)
+    return DiT(depth=13, hidden_size=384, patch_size=1, num_heads=16, **kwargs)
 
 DiT_models = {
     'DiT-XL/1': DiT_XL_1,

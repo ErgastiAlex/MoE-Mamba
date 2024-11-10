@@ -17,48 +17,6 @@ NEG_INF = -1000000
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1).unsqueeze(1)) + shift.unsqueeze(1).unsqueeze(1)
 
-class MoS(nn.Module):
-    def __init__(self, hidden_dim, num_mos, act="soft"):
-        super(MoS, self).__init__()
-        self.net = nn.Sequential(
-            nn.Linear(hidden_dim, num_mos),
-        )
-        self.noise_linear =nn.Linear(hidden_dim, num_mos)
-        self.act=act
-        if act == "soft":
-            self.out = nn.Softmax(dim=-1)
-        else:
-            self.out = nn.Sigmoid()
-        #TODO: Inizializzare linear con 0 per fare si che all'inizio il peso sia 1/4 per ogni testa
-        # nn.init.constant_(self.net[0].weight, 0)
-     
-    
-    def forward(self, x):
-        logits = self.net(x)
-        if self.act=="soft" and self.training:
-            noise_logits = self.noise_linear(x)
-            noise = torch.randn_like(logits)*F.softplus(noise_logits)
-            noisy_logits = logits + noise
-            return self.out(noisy_logits)
-        else:
-            return self.out(logits)
-#         # return logits, self.soft(logits)
-# class MoE(nn.Module):
-#     def __init__(self, hidden_dim, num_moe):
-#         super(MoE, self).__init__()
-#         self.net = nn.Sequential(
-#             nn.Linear(hidden_dim, num_moe),
-#         )
-
-#         self.soft = nn.Softmax(dim=-1)
-
-#         # TODO: Inizializzare linear con 0 per fare si che all'inizio il peso sia 1/4 per ogni testa
-#         # init linear to zero
-
-#     def forward(self, x):
-#         logits = self.net(x)
-        
-#         return self.soft(logits)
 class SS2D(nn.Module):
     def __init__(
             self,
@@ -77,8 +35,6 @@ class SS2D(nn.Module):
             bias=False,
             device=None,
             dtype=None,
-            use_moe=False,
-            use_weighted=False,
             number=0,
             num_scans=4,
             skip_gate=False,
@@ -87,10 +43,6 @@ class SS2D(nn.Module):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
         
-        assert not (use_moe and use_weighted), "Cannot use both MoS and weighted sum"
-
-        self.use_moe = use_moe
-        self.use_weighted = use_weighted
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
@@ -139,11 +91,6 @@ class SS2D(nn.Module):
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
         self.dropout = nn.Dropout(dropout) if dropout > 0. else None
 
-        if self.use_moe:
-            self.mos = MoS(self.d_inner, self.num_scans)
-        
-        if self.use_weighted:
-            self.weight = nn.Parameter(torch.zeros(self.num_scans))
 
     @staticmethod
     def dt_init(dt_rank, d_inner, dt_scale=1.0, dt_init="random", dt_min=0.001, dt_max=0.1, dt_init_floor=1e-4,
@@ -241,9 +188,6 @@ class SS2D(nn.Module):
         L = H * W
         K = self.num_scans
 
-        if self.use_moe:
-            weight_mos = self.mos(einops.rearrange(x, 'b d h w -> b (h w) d'))
-        
         if self.num_scans == 1:
             if self.number % 8 == 0:
                 x_hw = self.get_horizontal_scan1(x).reshape(B, 1, -1, L) # (1, 1, 192, 3136)
@@ -437,37 +381,7 @@ class SS2D(nn.Module):
         
         if self.num_scans > 1:
             y = torch.stack(y, dim=1)
-            if self.use_moe:
-                y = einops.rearrange(y, 'b k c h w -> b k c (h w)')
-                y = torch.einsum("b k c l, b l k -> b c l", y, weight_mos)
-
-
-                # import matplotlib.pyplot as plt
-
-                # fig, axs = plt.subplots(1, 2)
-                # for i in range(2):
-                #     #make all images the same size
-                #     axs[i].set_aspect('equal')
-                #     heatmap=axs[i].imshow(weight_mos[0,:,i].reshape(H,W).detach().cpu().numpy(), cmap='YlGn', vmin=0, vmax=1)
-                #     #disable ticks
-                #     axs[i].set_xticks([])
-                #     axs[i].set_yticks([])
-                #     #show colorbar
-                #     if i==1:
-                #         cax = fig.add_axes([axs[i].get_position().x1+0.01,axs[i].get_position().y0,0.02,axs[i].get_position().height])
-                #         plt.colorbar(heatmap, cax=cax) # Similar to fig.colorbar(im, cax = cax)
-
-                # #save with random name
-                # plt.savefig(f'./mm/weight_moe_{self.number}.png', bbox_inches='tight', pad_inches=0.1)
-            elif self.use_weighted:
-                #softmax of weights
-                s_weight = F.softmax(self.weight, dim=0)
-                y = einops.rearrange(y, 'b k c h w -> b k c (h w)')
-                s_weight = s_weight.unsqueeze(0).unsqueeze(0).repeat(y.shape[0], y.shape[-1],1)
-                y = torch.einsum("b k c l, b l k -> b c l", y, s_weight)
-            else:
-                y = torch.sum(y, dim=1)
-                #y = y1 + y2 + y3 + y4 
+            y = torch.sum(y, dim=1)
         return y
 
 
@@ -508,8 +422,6 @@ class VSSBlock(nn.Module):
             d_state: int = 16,
             expand: float = 2.,
             is_light_sr: bool = False,
-            use_moe=False,
-            use_weighted=False,
             number=0,
             num_scans=4,
             skip_gate=False,
@@ -518,34 +430,16 @@ class VSSBlock(nn.Module):
         super().__init__()
 
         self.ln_1 = norm_layer(hidden_dim)
-        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, use_moe=use_moe, use_weighted=use_weighted, number=number, num_scans=num_scans, skip_gate=skip_gate, **kwargs)
+        self.self_attention = SS2D(d_model=hidden_dim, d_state=d_state,expand=expand,dropout=attn_drop_rate, number=number, num_scans=num_scans, skip_gate=skip_gate, **kwargs)
         self.drop_path = DropPath(drop_path)
         self.skip_scale= nn.Parameter(torch.ones(hidden_dim))
-        # self.conv_blk = CAB(hidden_dim,is_light_sr)
-        # self.ln_2 = nn.LayerNorm(hidden_dim)
-        # self.skip_scale2 = nn.Parameter(torch.ones(hidden_dim))
 
-        # self.adaLN_modulation = nn.Sequential(
-        #     nn.SiLU(),
-        #     nn.Linear(hidden_dim, 6 * hidden_dim, bias=True)
-        # )
 
     def forward(self, x):
-        # shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        B, L, D = x.shape
-
-        x = x.view(B, int(np.sqrt(L)), int(np.sqrt(L)), D).contiguous()  # [B,H,W,C]
-
+        """ 
+        x = B, H, W, C
+        """
         x = x*self.skip_scale + self.drop_path(self.self_attention(x)) # [B,H,W,C]
-
-        # x1 = modulate(self.ln_1(x), shift_msa, scale_msa)
-        # x = x*self.skip_scale + gate_msa.unsqueeze(1).unsqueeze(1)*self.drop_path(self.self_attention(x1))
-
-        # #gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        # x2 = modulate(self.ln_2(x), shift_mlp, scale_mlp).permute(0, 3, 1, 2).contiguous()
-        # x = x*self.skip_scale2 + gate_mlp.unsqueeze(1).unsqueeze(1)*self.conv_blk(x2).permute(0, 2, 3, 1).contiguous()
-
-        x = x.view(B, -1, D).contiguous()
         return x
 
 

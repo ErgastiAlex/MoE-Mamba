@@ -145,12 +145,11 @@ def main(args):
         num_classes=args.num_classes,
         learn_sigma=False,
         use_checkpoint=args.use_ckpt,
-        use_mamba=args.use_mamba,
-        use_moe=args.use_moe,
-        use_weighted=args.use_weighted,
         learn_pos_emb = args.learn_pos_emb,
         num_scans=args.num_scans,
-        has_text=args.has_text)
+        has_text=args.has_text,
+        skip_gate=args.skip_gate,
+        skip_conn=args.skip_conn)
     # Note that parameter initialization is done within the DiT constructor
     ema = deepcopy(model)  # Create an EMA of the model for use after training
     requires_grad(ema, False)
@@ -266,7 +265,7 @@ def main(args):
     for epoch in range(args.epochs):
         logger.info(f"Beginning epoch {epoch}...")
 
-        if train_steps >= 500000:
+        if train_steps >= 400000:
             break
 
         for x, y in loader:
@@ -277,7 +276,7 @@ def main(args):
                 y = text_emb(random.choice(captions))
                 x = torch.stack(x)
                 
-            if train_steps >= 300000:
+            if train_steps >= 400000:
                 break
 
 
@@ -405,11 +404,10 @@ if __name__ == "__main__":
     parser.add_argument("--log-every", type=int, default=500)
     parser.add_argument("--ckpt-every", type=int, default=15000)
     parser.add_argument("--sample-every", type=int, default=10000)
-    parser.add_argument('--use_mamba', action='store_true') 
-    parser.add_argument('--use_moe', action='store_true')
-    parser.add_argument('--use_weighted', action='store_true')
     parser.add_argument('--learn_pos_emb', action='store_true')
+    parser.add_argument('--skip_gate', action='store_true')
     parser.add_argument('--use_ckpt', action='store_true')
+    parser.add_argument('--skip_conn', action='store_true')
 
     parser.add_argument('--has_text', action='store_true')
 
