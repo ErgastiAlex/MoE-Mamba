@@ -167,6 +167,45 @@ class CrossAttention(nn.Module):
         return self.to_out(x)
 
 
+class UpsampleOneStep(nn.Sequential):
+    """UpsampleOneStep module (the difference with Upsample is that it always only has 1conv + 1pixelshuffle)
+       Used in lightweight SR to save parameters.
+
+    Args:
+        scale (int): Scale factor. Supported scales: 2^n and 3.
+        num_feat (int): Channel number of intermediate features.
+
+    """
+
+    def __init__(self, scale, num_feat, num_out_ch):
+        self.num_feat = num_feat
+        m = []
+        m.append(nn.Conv2d(num_feat, (scale**2) * num_out_ch, 3, 1, 1))
+        m.append(nn.PixelShuffle(scale))
+        super(UpsampleOneStep, self).__init__(*m)
+
+
+
+class Upsample(nn.Sequential):
+    """Upsample module.
+
+    Args:
+        scale (int): Scale factor. Supported scales: 2^n and 3.
+        num_feat (int): Channel number of intermediate features.
+    """
+
+    def __init__(self, scale, num_feat):
+        m = []
+        if (scale & (scale - 1)) == 0:  # scale = 2^n
+            for _ in range(int(math.log(scale, 2))):
+                m.append(nn.Conv2d(num_feat, 4 * num_feat, 3, 1, 1))
+                m.append(nn.PixelShuffle(2))
+        elif scale == 3:
+            m.append(nn.Conv2d(num_feat, 9 * num_feat, 3, 1, 1))
+            m.append(nn.PixelShuffle(3))
+        else:
+            raise ValueError(f'scale {scale} is not supported. Supported scales: 2^n and 3.')
+        super(Upsample, self).__init__(*m)
 
 #################################################################################
 #                                 Core DiT Model                                #
@@ -177,13 +216,13 @@ class DiTBlock(nn.Module):
     A DiT block with adaptive layer norm zero (adaLN-Zero) conditioning.
     """
     def __init__(self, hidden_size, 
-                       use_checkpoint=True, 
                        number=0, 
-                       num_scans=4,
                        has_text=False, 
+                       image_size=32,
                        skip_gate=False,
                        skip_conn=False,
-                       **block_kwargs):
+                       use_checkpoint=True):
+        
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         self.has_text = has_text
@@ -195,7 +234,7 @@ class DiTBlock(nn.Module):
                 d_state=16,
                 input_resolution=256,
                 number=number,
-                num_scans=num_scans,
+                image_size=image_size,
                 skip_gate=skip_gate)
         
         self.use_checkpoint = use_checkpoint
@@ -222,25 +261,27 @@ class DiTBlock(nn.Module):
         if self.use_checkpoint:
             return checkpoint.checkpoint(self._forward, x, c, skip, text)
         else:
-            return self._forward(x, c, text)
+            return self._forward(x, c, skip, text)
     
     def _forward(self, x, c, skip=None, text=None):
         """
             x: [B, H, W, C]
         """
+        B, H, W, C = x.shape
         if skip is not None and self.skip_conn:
             x = torch.cat([x, skip], dim=-1)
             x = self.skip(x)
+
 
         if not self.has_text:
             shift_msa, scale_msa, gate_msa = self.adaLN_modulation(c).chunk(3, dim=1)
             x = x + gate_msa.unsqueeze(1).unsqueeze(1) * self.attn(modulate2d(self.norm1(x), shift_msa, scale_msa))
         else:
             shift_msa, scale_msa, gate_msa, shift_mca, scale_mca, gate_mca= self.adaLN_modulation(c).chunk(6, dim=1)
-
             x = x + gate_msa.unsqueeze(1).unsqueeze(1) * self.attn(modulate2d(self.norm1(x), shift_msa, scale_msa))
-            x = x + gate_mca.unsqueeze(1).unsqueeze(1) * self.mca(modulate2d(self.norm_mca(x), shift_mca, scale_mca), text)
-
+            x = x.view(B, -1, C)
+            x = x + gate_mca.unsqueeze(1) * self.mca(modulate(self.norm_mca(x), shift_mca, scale_mca), text)
+            x = x.view(B, H, W, C)
         return x
     
 
@@ -277,7 +318,6 @@ class DiT(nn.Module):
         hidden_size=1152,
         depth=28,
         num_heads=16,
-        mlp_ratio=4.0,
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
@@ -287,7 +327,8 @@ class DiT(nn.Module):
         has_text = False,
         d_context = 768,
         skip_gate = False,
-        skip_conn = False
+        skip_conn = False,
+        use_convtranspose=False,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -298,7 +339,7 @@ class DiT(nn.Module):
         self.learn_pos_emb = learn_pos_emb
         self.num_classes = num_classes
         self.has_text = has_text
-        #bias = true
+        self.use_convtranspose = use_convtranspose
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, hidden_size)
         self.t_embedder = TimestepEmbedder(hidden_size)
         
@@ -313,39 +354,53 @@ class DiT(nn.Module):
 
         self.enc_blocks = []
         enc_div = (depth//2)//3
+        image_size = input_size
         for i in range(depth//2):
             self.enc_blocks.append(DiTBlock(hidden_size, 
                     number=i, 
-                    num_scans=num_scans,
                     has_text=has_text,
                     skip_gate=skip_gate,
-                    decoder=False))
+                    skip_conn=False,
+                    image_size = image_size,
+                    use_checkpoint=use_checkpoint))
             if (i+1) % enc_div == 0:
                 self.enc_blocks.append(
-                    nn.Conv2d(hidden_size, hidden_size, kernel_size=2, stride=2, padding=0)
+                        nn.Conv2d(hidden_size, hidden_size, kernel_size=2, stride=2, padding=0)
                 )
+                image_size //= 2
+
+                
         
         self.enc_blocks = nn.ModuleList(self.enc_blocks)
 
         self.middle_block = DiTBlock(hidden_size,
                     number=depth//2, 
-                    num_scans=num_scans,
                     has_text=has_text,
-                    skip_conn=False)
+                    image_size=image_size,
+                    skip_conn=False,
+                    use_checkpoint=use_checkpoint,
+                    )
     
         self.dec_blocks = []
         dec_div = (depth//2)//3
         for i in range(depth//2):
             if (i) % dec_div == 0:
-                self.dec_blocks.append(
-                    nn.ConvTranspose2d(hidden_size, hidden_size, kernel_size=2, stride=2, padding=0)
-                )
+                if self.use_convtranspose:
+                    self.dec_blocks.append(
+                        nn.ConvTranspose2d(hidden_size, hidden_size, kernel_size=2, stride=2, padding=0)
+                    )
+                else:
+                    self.dec_blocks.append(UpsampleOneStep(2, hidden_size, hidden_size))
+                image_size *=2
+
             self.dec_blocks.append(DiTBlock(hidden_size, 
                     number=i+depth//2+1, 
-                    num_scans=num_scans,
                     has_text=has_text,
+                    image_size=image_size,
                     skip_gate=skip_gate,
-                    skip_conn=skip_conn))
+                    skip_conn=skip_conn,
+                    use_checkpoint=use_checkpoint,
+                    ))
 
         self.dec_blocks = nn.ModuleList(self.dec_blocks)
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
@@ -383,6 +438,7 @@ class DiT(nn.Module):
             if hasattr(block, "adaLN_modulation"):
                 nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
                 nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
         for block in self.dec_blocks:
             if hasattr(block, "adaLN_modulation"):
                 nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
