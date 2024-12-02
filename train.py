@@ -146,7 +146,7 @@ def main(args):
         learn_sigma=False,
         use_checkpoint=args.use_ckpt,
         learn_pos_emb = args.learn_pos_emb,
-        num_scans=args.num_scans,
+        use_convtranspose=args.use_convtranspose,
         has_text=args.has_text,
         skip_gate=args.skip_gate,
         skip_conn=args.skip_conn)
@@ -318,6 +318,8 @@ def main(args):
             if train_steps % args.sample_every == 0 and train_steps > 0:
                 with torch.no_grad():
                     my_metrics.reset()
+
+                    i = 0
                     for x, y in test_loader:
                         if args.has_text:
                             captions=[]
@@ -331,9 +333,6 @@ def main(args):
                         n = x.shape[0]
                         z = torch.randn(n, 4, latent_size, latent_size, device=device)*rectified_flow.noise_scale
 
-                        # y = torch.cat([y, y_null], dim=0)
-                        # z = torch.cat([z,z], dim=0)
-
                         if args.num_classes != 0:
                             assert False, "Not implemented"
                             model_kwargs = dict(y=y, cfg_scale=2.0)
@@ -344,14 +343,16 @@ def main(args):
                         samples = sample_fn(z, model_kwargs=model_kwargs, progress=False)
 
                         samples = vae.decode(samples / 0.18215).sample
-                        # samples, _ = torch.chunk(samples, 2, dim=0)
 
                         x = out2img(x)
                         samples = out2img(samples)
 
-
                         my_metrics.update_real(x)
                         my_metrics.update_fake(samples)
+
+                        i+=1
+                        if i > args.samples and args.samples > 0:
+                            break
 
                     _metric_dict = my_metrics.compute()
                     fid = _metric_dict["fid"]
@@ -368,6 +369,8 @@ def main(args):
                         }, checkpoint_path)
                         
                     best_fid = min(fid, best_fid)
+
+                    
 
 
     model.eval()  # important! This disables randomized embedding dropout
@@ -394,7 +397,6 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=2)
-    parser.add_argument("--num_scans", type=int, default=4, choices=[1, 2, 4])
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-seed", type=int, default=0)
@@ -408,8 +410,9 @@ if __name__ == "__main__":
     parser.add_argument('--skip_gate', action='store_true')
     parser.add_argument('--use_ckpt', action='store_true')
     parser.add_argument('--skip_conn', action='store_true')
-
+    parser.add_argument('--samples', type=int, default=5000)
     parser.add_argument('--has_text', action='store_true')
+    parser.add_argument('--use_convtranspose', action='store_true')
 
     parser.add_argument("--sampling", type=str, choices=["log", "uniform"], default="log")
     args = parser.parse_args()

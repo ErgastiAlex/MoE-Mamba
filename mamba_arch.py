@@ -216,13 +216,73 @@ class SS2D(nn.Module):
         D._no_weight_decay = True
         return D
     
+    def get_horizontal_scan1(self, x):
+        x[:,:,1::2] = torch.flip(x[:,:,1::2], dims=[3]) #flip column
+        return x
+    
+    def revert_horizontal_scan1(self, x):
+        return self.get_horizontal_scan1(x)
+
+    def get_horizontal_scan2(self, x):
+        x[:,:,0::2] = torch.flip(x[:,:,0::2], dims=[3]) #flip column
+        return x
+    
+    def revert_horizontal_scan2(self, x):
+        return self.get_horizontal_scan2(x)
+
+    def get_vertical_scan1(self, x):
+        x[:,:,:,1::2] = torch.flip(x[:,:,:,1::2], dims=[2]) #flip row
+        x = torch.transpose(x, dim0=2, dim1=3)
+        return x
+
+    def revert_vertical_scan1(self, x):
+        x = torch.transpose(x, dim0=2, dim1=3) #change H and W
+        x[:,:,:,1::2] = torch.flip(x[:,:,:,1::2], dims=[2]) #flip row
+        return x
+
+    def get_vertical_scan2(self, x):
+        x[:,:,:,0::2] = torch.flip(x[:,:,:,0::2], dims=[2])
+        x = torch.transpose(x, dim0=2, dim1=3)
+        return x
+    
+    def revert_vertical_scan2(self, x):
+        x = torch.transpose(x, dim0=2, dim1=3)
+        x[:,:,:,0::2] = torch.flip(x[:,:,:,0::2], dims=[2])
+        return x
+    
     def forward_core(self, x: torch.Tensor):
         B, C, H, W = x.shape
         L = H * W
         K = 1
 
-        x = x.view(B, 1, C, -1) # B, 1, D, L
-        xs = x[:,:,:,self.shuffle_index]
+        # x = x.view(B, 1, C, -1) # B, 1, D, L
+
+        if self.number % 8 == 0:
+            x_hw = self.get_horizontal_scan1(x).reshape(B, 1, -1, L) # (1, 1, 192, 3136)
+            xs = x_hw
+        elif self.number % 8 == 1:
+            x_hw = self.get_horizontal_scan1(x).reshape(B, 1, -1, L)
+            xs = torch.flip(x_hw, dims=[-1])
+        elif self.number % 8 == 2:
+            x_hw = self.get_horizontal_scan2(x).reshape(B, 1, -1, L)
+            xs = x_hw
+        elif self.number % 8 == 3:
+            x_hw = self.get_horizontal_scan2(x).reshape(B, 1, -1, L)
+            xs = torch.flip(x_hw, dims=[-1])
+        elif self.number % 8 == 4:
+            x_wh = self.get_vertical_scan1(x).reshape(B, 1, -1, L)
+            xs = x_wh
+        elif self.number % 8 == 5:
+            x_wh = self.get_vertical_scan1(x).reshape(B, 1, -1, L)
+            xs = torch.flip(x_wh, dims=[-1])
+        elif self.number % 8 == 6:
+            x_wh = self.get_vertical_scan2(x).reshape(B, 1, -1, L)
+            xs = x_wh
+        elif self.number % 8 == 7:
+            x_wh = self.get_vertical_scan2(x).reshape(B, 1, -1, L)
+            xs = torch.flip(x_wh, dims=[-1])
+
+        # xs = x[:,:,:,self.shuffle_index]
 
         # in_proj_w = self.in_proj_w.unsqueeze(0).repeat(B,1,1)
         # D = einops.einsum(xs, in_proj_w, "b k d l1, b d l2 -> b k l1 l2")
@@ -245,13 +305,21 @@ class SS2D(nn.Module):
         dt_projs_bias = self.dt_projs_bias.float().view(-1) # (k * d)
         
     
+        # out_y = self.selective_scan(
+        #     xs, dts,
+        #     As, Bs, Cs, Ds, z=None,
+        #     delta_bias=dt_projs_bias,
+        #     delta_softplus=True,
+        #     return_last_state=False,
+        # ).view(B, -1, L)       
+    
         out_y = self.selective_scan(
             xs, dts,
             As, Bs, Cs, Ds, z=None,
             delta_bias=dt_projs_bias,
             delta_softplus=True,
             return_last_state=False,
-        ).view(B, -1, L)
+        ).view(B, K, -1, L)
 
         # # C = out_y @ self.out_proj
         # out_proj_w = self.out_proj_w.unsqueeze(0).repeat(B, 1, 1)
@@ -259,8 +327,46 @@ class SS2D(nn.Module):
         # C = F.softmax(C, dim=-1)
         # out_y = einops.einsum(C, out_y, "b l1 l2, b d l2 -> b d l1")
         # # out_y = C @ out_y
-        
-        return out_y[:,:,self.reorder_index]
+         
+        if self.number % 8 == 0:
+            out = out_y[:, 0].view(B, -1, H, W)
+            out = self.revert_horizontal_scan1(out)
+
+        elif self.number % 8 == 1:
+            out = out_y[:, 0].reshape(B, -1, L)
+            out = torch.flip(out, dims=[-1]).view(B, -1, H, W)
+            out = self.revert_horizontal_scan1(out)
+
+        elif self.number % 8 == 2:
+            out = out_y[:, 0].view(B, -1, H, W)
+            out = self.revert_horizontal_scan2(out)
+            
+        elif self.number % 8 == 3:
+            out = out_y[:, 0].reshape(B, -1, L)
+            out = torch.flip(out, dims=[-1]).view(B, -1, H, W)
+            out = self.revert_horizontal_scan2(out)
+
+        elif self.number % 8 == 4:
+            out = out_y[:, 0].view(B, -1, W, H)
+            out = self.revert_vertical_scan1(out)
+
+        elif self.number % 8 == 5:
+            out = out_y[:, 0].reshape(B, -1, L)
+            out = torch.flip(out, dims=[-1]).view(B, -1, W, H)
+            out = self.revert_vertical_scan1(out)
+
+        elif self.number % 8 == 6:
+            out = out_y[:, 0].view(B, -1, W, H)
+            out = self.revert_vertical_scan2(out)
+
+        elif self.number % 8 == 7:
+            out = out_y[:, 0].reshape(B, -1, L)
+            out = torch.flip(out, dims=[-1]).view(B, -1, W, H)
+            out = self.revert_vertical_scan2(out).view(B, -1, H, W)
+
+        y = einops.rearrange(out, 'b c h w -> b c (h w)')
+        return y
+        # return out_y[:,:,self.reorder_index]
 
 
     def forward(self, x: torch.Tensor, **kwargs):
